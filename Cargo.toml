@@ -30,9 +30,11 @@ thiserror = "2.0.18"
 tracing = "0.1.43"
 tracing-subscriber = { version = "0.3.22", features = ["env-filter", "time"] }
 base64 = "0.22"
+bytes = "1.7"
 hex = "0.4.3"
 bs58 = "0.5.1"
 regex = "1.10"
+socket2 = { version = "0.5", features = ["all"] }
 
 # Proc Macro
 proc-macro2 = "1.0"
@@ -87,9 +89,11 @@ thiserror.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 base64.workspace = true
+bytes.workspace = true
 hex.workspace = true
 bs58.workspace = true
 regex.workspace = true
+socket2.workspace = true
 
 # Proc Macro
 proc-macro2.workspace = true
