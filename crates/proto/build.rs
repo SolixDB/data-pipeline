@@ -1,7 +1,10 @@
+use std::{env, path::PathBuf};
+
 fn main() {
+    let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
+
     #[cfg(feature = "parser")]
     {
-        let out_dir = std::path::PathBuf::from(std::env::var("OUT_DIR").unwrap());
         std::env::set_var("PROTOC", protobuf_src::protoc());
         // token
         prost_build::Config::new()
@@ -22,7 +25,6 @@ fn main() {
 
     #[cfg(feature = "stream")]
     {
-        let out_dir = std::path::PathBuf::from(std::env::var("OUT_DIR").unwrap());
         std::env::set_var("PROTOC", protobuf_src::protoc());
         tonic_build::configure()
             .file_descriptor_set_path(out_dir.join("stream_descriptor.bin"))

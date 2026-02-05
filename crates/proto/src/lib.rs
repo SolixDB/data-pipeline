@@ -53,5 +53,4 @@ mod vixen {
     }
 }
 
-#[allow(unused_imports)]
 pub use vixen::*;
