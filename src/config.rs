@@ -10,6 +10,12 @@ pub struct Config {
     pub reconnect_initial_interval_ms: u64,
     pub reconnect_max_interval_ms: u64,
     pub reconnect_max_elapsed_time_ms: Option<u64>,
+    /// ClickHouse URL for metrics (e.g. http://localhost:8123). If unset, metrics are not stored.
+    pub clickhouse_url: Option<String>,
+    /// ClickHouse user (e.g. pipeline). Optional; if unset, default user is used.
+    pub clickhouse_user: Option<String>,
+    /// ClickHouse password. Optional; required when using a user that has a password.
+    pub clickhouse_password: Option<String>,
 }
 
 impl Default for Config {
@@ -23,6 +29,9 @@ impl Default for Config {
             reconnect_initial_interval_ms: 500,
             reconnect_max_interval_ms: 30000,
             reconnect_max_elapsed_time_ms: None,
+            clickhouse_url: env::var("CLICKHOUSE_URL").ok().filter(|s| !s.is_empty()),
+            clickhouse_user: env::var("CLICKHOUSE_USER").ok().filter(|s| !s.is_empty()),
+            clickhouse_password: env::var("CLICKHOUSE_PASSWORD").ok().filter(|s| !s.is_empty()),
         }
     }
 }
