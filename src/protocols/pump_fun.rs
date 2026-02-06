@@ -6,6 +6,9 @@ const TRADE_EVENT_TIMESTAMP_OFFSET: usize = 8 + 32 + 8 + 8 + 1 + 32;
 /// Minimum size for pump.fun tradeEvent payload (after base64 decode).
 const TRADE_EVENT_MIN_SIZE: usize = 8 + 32 + 8 + 8 + 1 + 32 + 8 + 8 + 8 + 8 + 8 + 32 + 8 + 8;
 
+/// completePumpAmmMigrationEvent: 8(disc) + user(32) + mint(32) + mintAmount(8) + solAmount(8) + fee(8) + bondingCurve(32) + timestamp(8) + pool(32).
+const MIGRATION_EVENT_MIN_SIZE: usize = 8 + 32 + 32 + 8 + 8 + 8 + 32 + 8 + 32;
+
 pub fn has_create_in_logs(ix: &InstructionUpdate) -> bool {
     ix.shared.log_messages.iter().any(|l| {
         l.contains("Instruction: Create")
@@ -19,6 +22,10 @@ pub fn has_trade_in_logs(ix: &InstructionUpdate) -> bool {
         .log_messages
         .iter()
         .any(|l| l.contains("Instruction: Buy") || l.contains("Instruction: Sell"))
+}
+
+pub fn has_migrate_in_logs(ix: &InstructionUpdate) -> bool {
+    ix.shared.log_messages.iter().any(|l| l.contains("Instruction: Migrate"))
 }
 
 /// Extract on-chain txn_timestamp (ms) from the first tradeEvent in logs.
@@ -185,6 +192,7 @@ fn decode_trade_event(
         liquidity_sol,
         fee,
         is_create,
+        pool: None,
         suggested_compute_unit_limit: 300_000,
         token_decimals: 6,
         txn_timestamp,
@@ -209,6 +217,80 @@ pub fn parse_trade_events(ix: &InstructionUpdate, received_at: u64) -> Vec<crate
         };
         if let Some(trade) = decode_trade_event(&data, &signature, ix.shared.slot, is_create, received_at) {
             out.push(trade);
+        }
+    }
+    out
+}
+
+fn decode_migration_event(
+    data: &[u8],
+    signature: &str,
+    slot: u64,
+    received_at: u64,
+) -> Option<crate::events::Migration> {
+    if data.len() < MIGRATION_EVENT_MIN_SIZE {
+        return None;
+    }
+    let mut offset = 8;
+
+    let user = bs58::encode(&data[offset..offset + 32]).into_string();
+    offset += 32;
+
+    let mint_bytes = &data[offset..offset + 32];
+    if mint_bytes.iter().all(|&b| b == 0) || mint_bytes.iter().all(|&b| b == 255) {
+        return None;
+    }
+    let mint = bs58::encode(mint_bytes).into_string();
+    offset += 32;
+
+    let token_amount = u64::from_le_bytes(data[offset..offset + 8].try_into().ok()?);
+    offset += 8;
+    let sol_amount = u64::from_le_bytes(data[offset..offset + 8].try_into().ok()?);
+    offset += 8;
+    let fee = u64::from_le_bytes(data[offset..offset + 8].try_into().ok()?);
+    offset += 8;
+    let bonding_curve = bs58::encode(&data[offset..offset + 32]).into_string();
+    offset += 32;
+
+    let txn_timestamp_sec = u64::from_le_bytes(data[offset..offset + 8].try_into().ok()?);
+    offset += 8;
+    if !(1577836800..=2524608000).contains(&txn_timestamp_sec) {
+        return None;
+    }
+    let txn_timestamp = txn_timestamp_sec * 1000;
+
+    let pool = bs58::encode(&data[offset..offset + 32]).into_string();
+
+    Some(crate::events::Migration {
+        signature: signature.to_string(),
+        slot,
+        mint,
+        user,
+        bonding_curve,
+        pool,
+        token_amount,
+        sol_amount,
+        fee,
+        txn_timestamp,
+        received_at,
+        sent_at: 0,
+    })
+}
+
+pub fn parse_migration_events(ix: &InstructionUpdate, received_at: u64) -> Vec<crate::events::Migration> {
+    use base64::Engine;
+    let decoder = base64::engine::general_purpose::STANDARD;
+    let signature = bs58::encode(ix.shared.signature.as_slice()).into_string();
+    let mut out = Vec::new();
+    for log in &ix.shared.log_messages {
+        let Some(data_str) = log.strip_prefix("Program data: ") else {
+            continue;
+        };
+        let Ok(data) = decoder.decode(data_str.trim()) else {
+            continue;
+        };
+        if let Some(migration) = decode_migration_event(&data, &signature, ix.shared.slot, received_at) {
+            out.push(migration);
         }
     }
     out

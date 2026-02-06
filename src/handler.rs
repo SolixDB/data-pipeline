@@ -27,6 +27,7 @@ pub async fn handle_stream_updates(
     let ping_interval = std::time::Duration::from_secs(30);
     let launch_count = Arc::new(AtomicU64::new(0));
     let trade_count = Arc::new(AtomicU64::new(0));
+    let migration_count = Arc::new(AtomicU64::new(0));
 
     while let Some(message) = stream.next().await {
         match message {
@@ -38,6 +39,7 @@ pub async fn handle_stream_updates(
                             &*parser_map,
                             &*launch_count,
                             &*trade_count,
+                            &*migration_count,
                             ws_server.as_ref(),
                             metrics_client.as_ref().map(Arc::as_ref),
                         )
@@ -70,6 +72,7 @@ async fn handle_transaction(
     parser_map: &HashMap<Vec<u8>, &'static str>,
     launch_count: &AtomicU64,
     trade_count: &AtomicU64,
+    migration_count: &AtomicU64,
     ws_server: &WsServer,
     metrics_client: Option<&clickhouse::Client>,
 ) -> anyhow::Result<()> {
@@ -135,6 +138,22 @@ async fn handle_transaction(
         );
         trade.sent_at = unix_timestamp_micros();
         if let Ok(bytes) = rmp_serde::to_vec(&ServerMessage::Trade(trade)) {
+            ws_server.broadcast(bytes);
+        }
+        info!("{} | clients={}", log_msg, ws_server.client_count());
+    }
+
+    let migrations = multi_parser::parse_migration_events(&instructions, parser_map, received_at);
+    for mut migration in migrations {
+        let count = migration_count.fetch_add(1, Ordering::Relaxed) + 1;
+        let log_msg = format!(
+            "#{} MIGRATE | mint={} -> pool={}",
+            count,
+            &migration.mint[..migration.mint.len().min(8)],
+            &migration.pool[..migration.pool.len().min(8)]
+        );
+        migration.sent_at = unix_timestamp_micros();
+        if let Ok(bytes) = rmp_serde::to_vec(&ServerMessage::Migration(migration)) {
             ws_server.broadcast(bytes);
         }
         info!("{} | clients={}", log_msg, ws_server.client_count());
