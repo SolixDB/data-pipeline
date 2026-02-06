@@ -10,11 +10,8 @@ pub struct Config {
     pub reconnect_initial_interval_ms: u64,
     pub reconnect_max_interval_ms: u64,
     pub reconnect_max_elapsed_time_ms: Option<u64>,
-    /// ClickHouse URL for metrics (e.g. http://localhost:8123). If unset, metrics are not stored.
     pub clickhouse_url: Option<String>,
-    /// ClickHouse user (e.g. pipeline). Optional; if unset, default user is used.
     pub clickhouse_user: Option<String>,
-    /// ClickHouse password. Optional; required when using a user that has a password.
     pub clickhouse_password: Option<String>,
 }
 
