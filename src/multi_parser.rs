@@ -62,13 +62,38 @@ pub fn parse_trade_events(
     let mut out = Vec::new();
     for ix in flat {
         let program_bytes: &[u8] = ix.program.as_ref();
+        if parser_map.get(program_bytes) == Some(&"pump_fun") {
+            if protocols::pump_fun::has_trade_in_logs(ix) {
+                out.extend(protocols::pump_fun::parse_trade_events(ix, received_at));
+            }
+            continue;
+        }
+        if parser_map.get(program_bytes) == Some(&"pump_amm") {
+            if protocols::pump_amm::has_buy_in_logs(ix) || protocols::pump_amm::has_sell_in_logs(ix) {
+                out.extend(protocols::pump_amm::parse_amm_trade_events(ix, received_at));
+            }
+        }
+    }
+    out
+}
+
+pub fn parse_migration_events(
+    instructions: &[InstructionUpdate],
+    parser_map: &HashMap<Vec<u8>, &'static str>,
+    received_at: u64,
+) -> Vec<crate::events::Migration> {
+    let mut flat = Vec::new();
+    flatten_instructions(instructions, &mut flat);
+    let mut out = Vec::new();
+    for ix in flat {
+        let program_bytes: &[u8] = ix.program.as_ref();
         if parser_map.get(program_bytes) != Some(&"pump_fun") {
             continue;
         }
-        if !protocols::pump_fun::has_trade_in_logs(ix) {
+        if !protocols::pump_fun::has_migrate_in_logs(ix) {
             continue;
         }
-        out.extend(protocols::pump_fun::parse_trade_events(ix, received_at));
+        out.extend(protocols::pump_fun::parse_migration_events(ix, received_at));
     }
     out
 }

@@ -136,6 +136,9 @@ pub struct Trade {
     pub liquidity_sol: f64,
     pub fee: u64,
     pub is_create: bool,
+    /// Set for AMM (pump_amm) trades after migration; None for bonding-curve trades.
+    #[serde(default)]
+    pub pool: Option<String>,
     /// Suggested compute unit limit for a follow-up buy/sell (Pump.fun typically 300_000).
     #[serde(default = "default_compute_unit_limit")]
     pub suggested_compute_unit_limit: u32,
@@ -149,4 +152,22 @@ pub struct Trade {
 
 fn default_compute_unit_limit() -> u32 {
     300_000
+}
+
+/// Token migrated from pump.fun bonding curve to Raydium AMM (pump_amm).
+/// Frontend can use `mint` + `pool` to track the new pool and land trades there.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Migration {
+    pub signature: String,
+    pub slot: u64,
+    pub mint: String,
+    pub user: String,
+    pub bonding_curve: String,
+    pub pool: String,
+    pub token_amount: u64,
+    pub sol_amount: u64,
+    pub fee: u64,
+    pub txn_timestamp: u64,
+    pub received_at: u64,
+    pub sent_at: u64,
 }

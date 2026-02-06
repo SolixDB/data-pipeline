@@ -33,6 +33,7 @@ pub enum ServerMessage {
     ParsedInstruction(ParsedInstructionPayload),
     TokenLaunch(TokenLaunchPayload),
     Trade(crate::events::Trade),
+    Migration(crate::events::Migration),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
