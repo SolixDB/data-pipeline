@@ -9,7 +9,6 @@ const TABLE: &str = "pipeline_metrics";
 pub struct MetricRow {
     pub key: String,
     pub value: f64,
-    /// Unix timestamp in milliseconds (DateTime64(3)).
     pub updated_at: i64,
 }
 

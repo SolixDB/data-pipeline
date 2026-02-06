@@ -1,40 +1,57 @@
-# `main.rs` — Application Entry Point
+# Application entry point
 
-**Path:** `src/main.rs`
+**Source:** `src/main.rs`
+
+This document describes how the data-pipeline binary starts and what it does before the WebSocket server is running.
+
+---
 
 ## Purpose
 
-The binary entry point: initializes the process, configures logging and TLS, validates config, then starts and keeps the WebSocket server running.
+The binary is the process entry point. It initializes cryptography and logging, loads and validates configuration, then starts the WebSocket server and keeps the process alive until the server task exits or the process is terminated.
 
-## Flow
+---
 
-1. **TLS / crypto**  
-   Installs the default rustls crypto provider (e.g. `aws_lc_rs`) so any TLS used later (e.g. gRPC client) works.
+## Startup flow
 
-2. **Logging**  
-   Sets up `tracing_subscriber` with:
-   - Filter from `RUST_LOG` (default: `info`)
-   - No target / thread ID / file / line in the log format (keeps logs short)
+**1. TLS and cryptography**
 
-3. **Configuration**  
-   Builds `Config` from environment (see [config.md](config.md)), then calls `config.validate()?` so the process fails fast if required env (e.g. `GRPC_ENDPOINT`) is missing or invalid.
+The default rustls crypto provider (e.g. `aws_lc_rs`) is installed so that any TLS used later (for example by the Geyser gRPC client) works correctly.
 
-4. **WebSocket server**  
-   - Reads `WS_PORT` (default `5566`).
-   - Builds `WsConfig` from env (see [ws_server.md](ws_server.md#wsconfig)).
-   - Creates `WsServer` with that config and calls `start(ws_port)`.
-   - **Awaits the returned join handle** so the process stays alive and the WebSocket server runs until it exits or panics.
+**2. Logging**
+
+`tracing_subscriber` is configured with:
+
+- A filter from the `RUST_LOG` environment variable (default: `info`).
+- A format that omits target, thread ID, file, and line so log lines stay short.
+
+**3. Configuration**
+
+`Config` is built from the environment (see [config.md](config.md)). `config.validate()` is called so the process exits immediately with an error if required settings (such as `GRPC_ENDPOINT`) are missing or invalid.
+
+**4. WebSocket server**
+
+- The listen port is read from `WS_PORT` (default: 5566).
+- `WsConfig` is built from the environment (see [ws_server.md](ws_server.md)).
+- `WsServer` is created with that config and `start(ws_port)` is called.
+- The function returns a **join handle** for the server task. The main function **awaits** this handle so the process does not exit while the server is running.
+
+---
 
 ## Why the join handle is awaited
 
-`WsServer::start()` spawns the accept loop in a background task and returns its `JoinHandle`. If `main` did not await that handle, it would reach `Ok(())` and exit, shutting down the runtime and killing the WebSocket server. Awaiting the handle keeps the process running for the lifetime of the server.
+`WsServer::start()` spawns the accept loop in a background task and returns its `JoinHandle`. If `main` did not await that handle, execution would reach the end of `main`, the process would exit, and the runtime would shut down, stopping the WebSocket server. Awaiting the handle keeps the process running for the lifetime of the server task.
+
+---
 
 ## Dependencies
 
-- **Modules:** `config`, `client`, `messages`, `ws_server`
-- **Config:** Used for validation only in this binary; the gRPC `client` is not started here (see [client.md](client.md)).
+- **Modules:** `config`, `client`, `messages`, `ws_server`, and the handler/multi_parser pipeline.
+- **Config:** Used for validation in `main`; the gRPC client is constructed and used elsewhere (see [client.md](client.md)). The handler subscribes to Geyser and pushes parsed events to the WebSocket server.
+
+---
 
 ## See also
 
-- [config.md](config.md) — Env-based configuration
-- [ws_server.md](ws_server.md) — WebSocket server and `WsConfig`
+- [config.md](config.md) — Environment-based configuration.
+- [ws_server.md](ws_server.md) — WebSocket server and `WsConfig`.

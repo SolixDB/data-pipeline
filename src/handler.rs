@@ -1,5 +1,6 @@
 use crate::config::Config;
 use crate::db;
+use crate::events::TradeDirection;
 use crate::messages::{ServerMessage, TokenLaunchPayload};
 use crate::multi_parser;
 use crate::ws_server::WsServer;
@@ -25,6 +26,7 @@ pub async fn handle_stream_updates(
     let mut last_ping = std::time::Instant::now();
     let ping_interval = std::time::Duration::from_secs(30);
     let launch_count = Arc::new(AtomicU64::new(0));
+    let trade_count = Arc::new(AtomicU64::new(0));
 
     while let Some(message) = stream.next().await {
         match message {
@@ -35,6 +37,7 @@ pub async fn handle_stream_updates(
                             &tx_update,
                             &*parser_map,
                             &*launch_count,
+                            &*trade_count,
                             ws_server.as_ref(),
                             metrics_client.as_ref().map(Arc::as_ref),
                         )
@@ -66,6 +69,7 @@ async fn handle_transaction(
     tx_update: &yellowstone_grpc_proto::geyser::SubscribeUpdateTransaction,
     parser_map: &HashMap<Vec<u8>, &'static str>,
     launch_count: &AtomicU64,
+    trade_count: &AtomicU64,
     ws_server: &WsServer,
     metrics_client: Option<&clickhouse::Client>,
 ) -> anyhow::Result<()> {
@@ -73,7 +77,10 @@ async fn handle_transaction(
         .map_err(|e| anyhow::anyhow!("parse_from_txn: {:?}", e))?;
     let received_at = unix_timestamp_micros();
 
-    let launches = multi_parser::parse_token_launches(&instructions, parser_map, received_at);
+    let mut launches = multi_parser::parse_token_launches(&instructions, parser_map, received_at);
+    let trades = multi_parser::parse_trade_events(&instructions, parser_map, received_at);
+    multi_parser::enrich_token_launches(&instructions, parser_map, &mut launches, &trades);
+
     for mut launch in launches {
         let count = launch_count.fetch_add(1, Ordering::Relaxed) + 1;
         let log_msg = format!(
@@ -98,8 +105,36 @@ async fn handle_transaction(
             symbol: launch.symbol,
             uri: launch.uri,
             creator: launch.creator,
+            pump_accounts: launch.pump_accounts,
+            token_decimals: launch.token_decimals,
+            initial_bonding_curve_state: launch.initial_bonding_curve_state,
+            pump_constants: launch.pump_constants,
         };
         if let Ok(bytes) = rmp_serde::to_vec(&ServerMessage::TokenLaunch(payload)) {
+            ws_server.broadcast(bytes);
+        }
+        info!("{} | clients={}", log_msg, ws_server.client_count());
+    }
+
+    for mut trade in trades {
+        let count = trade_count.fetch_add(1, Ordering::Relaxed) + 1;
+        let dir = match trade.direction {
+            TradeDirection::Buy => "BUY",
+            TradeDirection::Sell => "SELL",
+        };
+        let create_marker = if trade.is_create { " (create)" } else { "" };
+        let log_msg = format!(
+            "#{} {} | {} | mint={} | tokens={} | sol={}{}",
+            count,
+            dir,
+            &trade.trader[..trade.trader.len().min(8)],
+            &trade.mint[..trade.mint.len().min(8)],
+            trade.token_amount,
+            trade.sol_amount,
+            create_marker
+        );
+        trade.sent_at = unix_timestamp_micros();
+        if let Ok(bytes) = rmp_serde::to_vec(&ServerMessage::Trade(trade)) {
             ws_server.broadcast(bytes);
         }
         info!("{} | clients={}", log_msg, ws_server.client_count());

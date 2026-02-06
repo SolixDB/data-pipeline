@@ -1,79 +1,91 @@
-# Data Pipeline — Code Documentation
+# Data pipeline documentation
 
-This directory is **for developers**: it explains the **data-pipeline** Rust code in detail (types, control flow, design). For project overview, build/run, and env vars, see the [repo README](../README.md) at the project root.
+This directory documents the **data-pipeline** service: what it does, how to run it, and how to consume its WebSocket stream. It is written for both operators and developers integrating with the pipeline.
 
-Here, each document below maps to a source file and describes its role, main types, and how it fits into the system.
+---
 
-## Quick overview
+## What this service does
 
-- **Entry point:** [main.rs](main.md) — TLS/logging setup, config validation, starts the WebSocket server and keeps the process alive.
-- **Configuration:** [config.rs](config.md) — gRPC-related env (endpoint, API key, limits).
-- **gRPC client:** [client.rs](client.md) — Builds and connects the Yellowstone Geyser gRPC client (for future pipeline that feeds the WebSocket).
-- **Wire format:** [messages.rs](messages.md) — Server/client message types (e.g. `Connected`, `Error`; future `Subscribe`/`Unsubscribe`).
-- **WebSocket server:** [ws_server.rs](ws_server.md) — Accept loop, broadcast channel, per-client handling, connection limit, lag-based disconnect.
+The data-pipeline subscribes to a Solana Geyser gRPC stream (Yellowstone), parses Pump.fun and Pump AMM transactions, and broadcasts **token launch** and **trade** events over a WebSocket. Clients receive real-time, structured data they can use to build Create/Buy/Sell transactions without extra RPC lookups.
 
-## How to use this documentation
+- **Input:** Geyser gRPC (transactions for Pump.fun and Pump AMM programs).
+- **Output:** WebSocket on a configurable port; each frame is a MessagePack-encoded server message (e.g. `token_launch`, `trade`).
+- **Parsed events:** New token creation (Pump.fun Create) and every buy/sell on the bonding curve or AMM, with accounts and curve state needed for transaction building.
 
-1. **New to the project?**  
-   Start with [main.md](main.md) to see how the binary boots, then read [ws_server.md](ws_server.md) to understand how clients connect and receive data.
+---
 
-2. **Adding the data pipeline?**  
-   You’ll wire [client.md](client.md) (gRPC) to [ws_server.md](ws_server.md) (`broadcast`), and use the types in [messages.md](messages.md) for the stream format.
+## Documentation index
 
-3. **Changing config or env vars?**  
-   See [config.md](config.md) for gRPC and [ws_server.md](ws_server.md#wsconfig) for WebSocket (e.g. `WS_MAX_CONNECTIONS`, `WS_MAX_LAG_DROP`).
+| Document | Audience | Contents |
+|----------|----------|----------|
+| [messages.md](messages.md) | Frontend/backend integrating with the WebSocket | Wire format: message types, payloads, field semantics, serialization. How to interpret and use each event. |
+| [pumpfun_accounts.md](pumpfun_accounts.md) | Frontend/backend building Pump.fun transactions | Program IDs, PDAs, bonding curve vs AMM, what the pipeline sends vs what you derive. Before/after migration. |
+| [main.md](main.md) | Developers working on the binary | Entry point, startup flow, TLS and logging. |
+| [config.md](config.md) | Operators and developers | Configuration and environment variables (gRPC, commitment). |
+| [client.md](client.md) | Developers wiring the pipeline | Geyser gRPC client construction and connection. |
+| [ws_server.md](ws_server.md) | Developers working on the server | WebSocket server: accept loop, broadcast, connection limits, lag handling. |
 
-4. **Debugging connections or broadcasts?**  
-   [ws_server.md](ws_server.md) describes the accept loop, `handle_connection`, lag handling, and connection limits.
+**If you are integrating a frontend or backend with the WebSocket:** read [messages.md](messages.md) first, then [pumpfun_accounts.md](pumpfun_accounts.md) when you need to build or interpret Pump.fun transactions.
 
-## Source file → doc mapping
+**If you are modifying the data-pipeline code:** start with [main.md](main.md) and the source-file table in this README, then open the doc for the file you are changing.
 
-| Source file      | Documentation   | What it covers |
-|------------------|-----------------|----------------|
-| `src/main.rs`    | [main.md](main.md)       | Entry point, TLS, logging, config validation, starting and awaiting the WebSocket server. |
-| `src/config.rs` | [config.md](config.md)   | `Config` fields, env vars (`GRPC_ENDPOINT`, `GRPC_API_KEY`), `validate()`. |
-| `src/client.rs` | [client.md](client.md)  | `GrpcClient`, `connect()`, TLS and token setup. |
-| `src/messages.rs`| [messages.md](messages.md) | `ServerMessage`, `ClientMessage`, payloads, serialization (MessagePack). |
-| `src/ws_server.rs` | [ws_server.md](ws_server.md) | `WsConfig`, `WsServer`, broadcast channel, accept loop, `handle_connection`, connection limit, lag disconnect. |
+---
 
 ## Architecture (high level)
 
 ```
-                    ┌─────────────────────────────────────┐
-                    │  main.rs                            │
-                    │  - TLS, logging, config validation  │
-                    │  - WsServer::start(port)            │
-                    │  - await server task (keep alive)   │
-                    └──────────────┬──────────────────────┘
-                                   │
-                    ┌──────────────▼──────────────────────┐
-                    │  ws_server.rs                       │
-                    │  - TcpListener (SO_REUSEADDR)       │
-                    │  - Accept → try_acquire → spawn     │
-                    │  - handle_connection per client     │
-                    │  - broadcast_tx → all clients       │
-                    └──────────────┬──────────────────────┘
-                                   │
-         ┌─────────────────────────┼─────────────────────────┐
-         │                         │                         │
-         ▼                         ▼                         ▼
-   Terminal 1               Terminal 2               Terminal N
-   (client_id, rx)          (client_id, rx)            (client_id, rx)
+  Geyser gRPC (Solana)     data-pipeline                WebSocket clients
+  ───────────────────     ─────────────                ─────────────────
+        │                       │                             │
+        │  Subscribe (Pump.fun  │   Parse Create / Buy /     │
+        │  + Pump AMM)          │   Sell; decode tradeEvent   │
+        │──────────────────────►│   Enrich (fee_recipient,    │
+        │                       │   initial curve state)      │
+        │                       │                             │
+        │                       │   broadcast(MessagePack)    │
+        │                       │────────────────────────────►│  Terminal / API
+        │                       │                             │
 ```
 
-The **producer** of the broadcast stream is not yet connected: it will be the pipeline that uses [client.rs](client.md) to subscribe to Geyser gRPC and call `WsServer::broadcast()` with serialized token/trade updates (see [messages.md](messages.md)).
+- **handler.rs** turns parsed transactions into `TokenLaunch` and `Trade` events, enriches launches from same-tx data, then serializes and broadcasts.
+- **ws_server.rs** holds the broadcast channel and per-client tasks; each client gets the same stream.
+
+---
+
+## Source files and their docs
+
+| Source file | Documentation | Summary |
+|-------------|---------------|---------|
+| `src/main.rs` | [main.md](main.md) | Entry point, TLS, logging, config validation, starts WebSocket server and keeps process alive. |
+| `src/config.rs` | [config.md](config.md) | Config struct, env vars (GRPC_ENDPOINT, GRPC_API_KEY), validation. |
+| `src/client.rs` | [client.md](client.md) | Geyser gRPC client build, connect, TLS, auth. |
+| `src/messages.rs` | [messages.md](messages.md) | ServerMessage / ClientMessage types, payloads, MessagePack wire format. |
+| `src/ws_server.rs` | [ws_server.md](ws_server.md) | WsConfig, WsServer, broadcast channel, accept loop, handle_connection, connection limit, lag disconnect. |
+| `src/handler.rs` | (see main + messages) | Parses transaction updates, produces launches and trades, enriches, broadcasts. |
+| `src/multi_parser.rs` | (see pumpfun_accounts) | Dispatches to Pump.fun parser, enrich_token_launches. |
+| `src/protocols/pump_fun.rs` | [pumpfun_accounts.md](pumpfun_accounts.md) | Create/tradeEvent parsing, account indices. |
+
+---
 
 ## Environment variables (reference)
 
 | Variable | Used in | Default | Purpose |
 |----------|---------|---------|---------|
-| `GRPC_ENDPOINT` | config | (required) | gRPC server URL. |
+| `GRPC_ENDPOINT` | config | required | Geyser gRPC server URL. |
 | `GRPC_API_KEY` | config | — | Optional gRPC auth token. |
 | `WS_PORT` | main | 5566 | WebSocket listen port. |
 | `WS_MAX_CONNECTIONS` | ws_server | no limit | Max concurrent WebSocket clients. |
-| `WS_MAX_LAG_DROP` | ws_server | no disconnect | Disconnect client if it drops ≥ N messages in one lag event. |
+| `WS_MAX_LAG_DROP` | ws_server | no disconnect | Disconnect client if it drops at least this many messages in one lag event. |
 | `RUST_LOG` | main | info | Log level filter. |
 
 ---
 
-For file-by-file explanations, open the linked `.md` files above.
+## Running the service
+
+Build and run from the data-pipeline directory. Set at least `GRPC_ENDPOINT`; other env vars are optional (see [config.md](config.md) and [ws_server.md](ws_server.md)).
+
+```bash
+cargo run
+```
+
+For project-level build/run and repository layout, see the [repository README](../README.md) at the project root.

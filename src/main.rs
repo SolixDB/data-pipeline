@@ -4,6 +4,7 @@ mod db;
 mod events;
 mod handler;
 mod messages;
+mod protocols;
 mod multi_parser;
 mod ws_server;
 
