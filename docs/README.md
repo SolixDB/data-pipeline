@@ -1,91 +1,52 @@
 # Data pipeline documentation
 
-This directory documents the **data-pipeline** service: what it does, how to run it, and how to consume its WebSocket stream. It is written for both operators and developers integrating with the pipeline.
+Everything you need to understand and run the data-pipeline is in this directory. No external references required.
 
 ---
 
 ## What this service does
 
-The data-pipeline subscribes to a Solana Geyser gRPC stream (Yellowstone), parses Pump.fun and Pump AMM transactions, and broadcasts **token launch** and **trade** events over a WebSocket. Clients receive real-time, structured data they can use to build Create/Buy/Sell transactions without extra RPC lookups.
+The binary subscribes to a Solana Geyser gRPC stream (Yellowstone), filters for transactions that touch **Pump.fun** or **Pump AMM** programs, parses them into token launches (Create), trades (Buy/Sell), and migrations (Migrate). It broadcasts these events over a WebSocket as MessagePack. If `CLICKHOUSE_URL` is set, it also writes aggregate metrics (launch count, gRPC/server latency) to ClickHouse.
 
-- **Input:** Geyser gRPC (transactions for Pump.fun and Pump AMM programs).
-- **Output:** WebSocket on a configurable port; each frame is a MessagePack-encoded server message (e.g. `token_launch`, `trade`).
-- **Parsed events:** New token creation (Pump.fun Create) and every buy/sell on the bonding curve or AMM, with accounts and curve state needed for transaction building.
+- **Input:** Geyser gRPC (transactions).
+- **Output:** WebSocket on `WS_PORT` (default 5566). Each frame is MessagePack: `ServerMessage` (`connected`, `token_launch`, `trade`, `migration`).
 
 ---
 
 ## Documentation index
 
-| Document | Audience | Contents |
-|----------|----------|----------|
-| [messages.md](messages.md) | Frontend/backend integrating with the WebSocket | Wire format: message types, payloads, field semantics, serialization. How to interpret and use each event. |
-| [pumpfun_accounts.md](pumpfun_accounts.md) | Frontend/backend building Pump.fun transactions | Program IDs, PDAs, bonding curve vs AMM, what the pipeline sends vs what you derive. Before/after migration. |
-| [main.md](main.md) | Developers working on the binary | Entry point, startup flow, TLS and logging. |
-| [config.md](config.md) | Operators and developers | Configuration and environment variables (gRPC, commitment). |
-| [client.md](client.md) | Developers wiring the pipeline | Geyser gRPC client construction and connection. |
-| [ws_server.md](ws_server.md) | Developers working on the server | WebSocket server: accept loop, broadcast, connection limits, lag handling. |
+| Document | Contents |
+|----------|----------|
+| [main.md](main.md) | Entry point: TLS, logging, config, ClickHouse setup, WebSocket server start, gRPC retry loop, shutdown. Step-by-step. |
+| [config.md](config.md) | Config struct, every field, env vars, validation, where it’s used. |
+| [client.md](client.md) | Geyser gRPC client: build, TLS, auth, connect. |
+| [handler.md](handler.md) | Stream loop, transaction handling, parsing pipeline, metrics, broadcast, ping. |
+| [multi_parser.md](multi_parser.md) | Parser map, flatten_instructions, parse_token_launches, parse_trade_events, parse_migration_events, enrich_token_launches. |
+| [events.md](events.md) | Domain types: TokenLaunch, Trade, Migration, BondingCurveState, PumpFunBondingCurveAccounts, PumpProtocolConstants, TradeDirection. Field-by-field. |
+| [messages.md](messages.md) | Wire format: ServerMessage, TokenLaunchPayload, ConnectedPayload. MessagePack, when each message is sent, payload fields. |
+| [ws_server.md](ws_server.md) | WsConfig, WsServer, broadcast channel, accept loop, handle_connection, connection limit, lag disconnect. |
+| [db.md](db.md) | ClickHouse client, pipeline_metrics table, metric keys, get_current_metrics, update_metrics_aggregates, update_metrics_aggregates_optional. |
+| [protocols.md](protocols.md) | pump_fun: Create/trade/migration detection and parsing (logs + instruction data). pump_amm: AMM buy/sell event layout and parsing. |
+| [pumpfun_accounts.md](pumpfun_accounts.md) | Program IDs, PDA seeds, Create/Buy/Sell account order, what the pipeline sends vs what you derive. For building transactions. |
+| [RUNBOOK.md](RUNBOOK.md) | Operations: how to confirm gRPC/data flow, ClickHouse, parse errors, WebSocket clients. |
 
-**If you are integrating a frontend or backend with the WebSocket:** read [messages.md](messages.md) first, then [pumpfun_accounts.md](pumpfun_accounts.md) when you need to build or interpret Pump.fun transactions.
-
-**If you are modifying the data-pipeline code:** start with [main.md](main.md) and the source-file table in this README, then open the doc for the file you are changing.
-
----
-
-## Architecture (high level)
-
-```
-  Geyser gRPC (Solana)     data-pipeline                WebSocket clients
-  ───────────────────     ─────────────                ─────────────────
-        │                       │                             │
-        │  Subscribe (Pump.fun  │   Parse Create / Buy /     │
-        │  + Pump AMM)          │   Sell; decode tradeEvent   │
-        │──────────────────────►│   Enrich (fee_recipient,    │
-        │                       │   initial curve state)      │
-        │                       │                             │
-        │                       │   broadcast(MessagePack)    │
-        │                       │────────────────────────────►│  Terminal / API
-        │                       │                             │
-```
-
-- **handler.rs** turns parsed transactions into `TokenLaunch` and `Trade` events, enriches launches from same-tx data, then serializes and broadcasts.
-- **ws_server.rs** holds the broadcast channel and per-client tasks; each client gets the same stream.
+**New to the codebase:** Start with [main.md](main.md) for the big picture, then [handler.md](handler.md) and [multi_parser.md](multi_parser.md) for the data path. Use [messages.md](messages.md) and [pumpfun_accounts.md](pumpfun_accounts.md) when integrating clients or building Pump.fun transactions.
 
 ---
 
-## Source files and their docs
-
-| Source file | Documentation | Summary |
-|-------------|---------------|---------|
-| `src/main.rs` | [main.md](main.md) | Entry point, TLS, logging, config validation, starts WebSocket server and keeps process alive. |
-| `src/config.rs` | [config.md](config.md) | Config struct, env vars (GRPC_ENDPOINT, GRPC_API_KEY), validation. |
-| `src/client.rs` | [client.md](client.md) | Geyser gRPC client build, connect, TLS, auth. |
-| `src/messages.rs` | [messages.md](messages.md) | ServerMessage / ClientMessage types, payloads, MessagePack wire format. |
-| `src/ws_server.rs` | [ws_server.md](ws_server.md) | WsConfig, WsServer, broadcast channel, accept loop, handle_connection, connection limit, lag disconnect. |
-| `src/handler.rs` | (see main + messages) | Parses transaction updates, produces launches and trades, enriches, broadcasts. |
-| `src/multi_parser.rs` | (see pumpfun_accounts) | Dispatches to Pump.fun parser, enrich_token_launches. |
-| `src/protocols/pump_fun.rs` | [pumpfun_accounts.md](pumpfun_accounts.md) | Create/tradeEvent parsing, account indices. |
-
----
-
-## Environment variables (reference)
-
-| Variable | Used in | Default | Purpose |
-|----------|---------|---------|---------|
-| `GRPC_ENDPOINT` | config | required | Geyser gRPC server URL. |
-| `GRPC_API_KEY` | config | — | Optional gRPC auth token. |
-| `WS_PORT` | main | 5566 | WebSocket listen port. |
-| `WS_MAX_CONNECTIONS` | ws_server | no limit | Max concurrent WebSocket clients. |
-| `WS_MAX_LAG_DROP` | ws_server | no disconnect | Disconnect client if it drops at least this many messages in one lag event. |
-| `RUST_LOG` | main | info | Log level filter. |
-
----
-
-## Running the service
-
-Build and run from the data-pipeline directory. Set at least `GRPC_ENDPOINT`; other env vars are optional (see [config.md](config.md) and [ws_server.md](ws_server.md)).
+## How to run
 
 ```bash
-cargo run
+cd data-pipeline
+export GRPC_ENDPOINT="https://your-geyser-endpoint"
+# optional: GRPC_API_KEY, WS_PORT, WS_MAX_CONNECTIONS, WS_MAX_LAG_DROP, CLICKHOUSE_URL, CLICKHOUSE_USER, CLICKHOUSE_PASSWORD, RUST_LOG
+cargo run --release
 ```
 
-For project-level build/run and repository layout, see the [repository README](../README.md) at the project root.
+WebSocket: `ws://0.0.0.0:5566` (or your `WS_PORT`). Logs: `Connected to blockchain gRPC`, `WebSocket server listening on ws://...`, and per-event lines (LAUNCH, BUY/SELL, MIGRATE).
+
+---
+
+## Architecture (one paragraph)
+
+**main** builds config, optional ClickHouse client (and ensures `pipeline_metrics` table), starts the WebSocket server, then runs a retry loop: connect gRPC (**client**), build **multi_parser**’s program-id map, subscribe to transactions that include Pump.fun and Pump AMM program IDs, and run **handler**’s `handle_stream_updates` on the stream. **handler** parses each transaction into instructions, calls **multi_parser** to get launches/trades/migrations and enriches launches; for each event it optionally writes metrics (**db**), serializes to MessagePack (**messages**), and broadcasts via **ws_server**. **multi_parser** delegates to **protocols** (pump_fun, pump_amm) for Create/trade/migration parsing. All types are in **events** and **messages**.

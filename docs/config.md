@@ -1,51 +1,52 @@
-# Configuration
+# config.rs — configuration
 
 **Source:** `src/config.rs`
 
-This document describes how the data-pipeline is configured and which environment variables it reads.
+Config is loaded from the environment and validated at startup. This doc lists every field, env var, and how it’s used. No external references.
 
 ---
 
-## Purpose
+## Config struct (all fields)
 
-Configuration is loaded from the environment and used when building and connecting the Geyser gRPC client (see [client.md](client.md)). Validation runs at startup so the process fails fast if required values are missing or invalid.
-
----
-
-## Config struct
-
-| Field | Environment variable | Description |
-|-------|----------------------|-------------|
-| `endpoint` | `GRPC_ENDPOINT` | **Required.** URL of the Geyser gRPC endpoint (e.g. `https://...` or `http://...`). |
-| `api_token` | `GRPC_API_KEY` | Optional. Authentication token for the gRPC service. |
-| `commitment` | — | Set in code. Default is `Processed`. |
-| `max_decoding_message_size` | — | Set in code. Maximum size of decoded gRPC messages (e.g. 1 GiB). |
-| `reconnect_initial_interval_ms` | — | Set in code. Initial backoff interval for reconnection (e.g. 500 ms). |
-| `reconnect_max_interval_ms` | — | Set in code. Maximum backoff interval (e.g. 30 s). |
-| `reconnect_max_elapsed_time_ms` | — | Set in code. Optional cap on total time spent reconnecting. |
+| Field | Type | Env var | Meaning |
+|-------|------|---------|--------|
+| `endpoint` | `String` | `GRPC_ENDPOINT` | Geyser gRPC URL. Required. Must start with `http://` or `https://`. |
+| `api_token` | `Option<String>` | `GRPC_API_KEY` | Optional auth token; sent as x_token on gRPC. |
+| `commitment` | `CommitmentLevel` | — | Fixed in code: `Processed`. Used in subscribe request and ping. |
+| `max_decoding_message_size` | `usize` | — | Fixed: 1024 * 1024 * 1024 (1 GiB). Passed to gRPC client builder. |
+| `reconnect_initial_interval_ms` | `u64` | — | Fixed: 500. First backoff delay when gRPC stream fails. |
+| `reconnect_max_interval_ms` | `u64` | — | Fixed: 30000. Cap on backoff interval. |
+| `reconnect_max_elapsed_time_ms` | `Option<u64>` | — | Fixed: None. If set, backoff would stop after this total time. |
+| `clickhouse_url` | `Option<String>` | `CLICKHOUSE_URL` | If set and non-empty, ClickHouse client is created and metrics are written. |
+| `clickhouse_user` | `Option<String>` | `CLICKHOUSE_USER` | Optional; empty string filtered out. |
+| `clickhouse_password` | `Option<String>` | `CLICKHOUSE_PASSWORD` | Optional; empty string filtered out. |
 
 ---
 
-## Default and validation
+## Default (Config::default())
 
-**Default:** `Config::default()` reads from the environment: `GRPC_ENDPOINT` is required (missing value causes a panic or error depending on usage); `GRPC_API_KEY` is optional.
-
-**Validation:** `validate()` checks that:
-
-- `endpoint` is non-empty.
-- `endpoint` starts with `http://` or `https://`.
-
-It returns `anyhow::Result<()>`. The binary calls it in `main` so invalid configuration stops the process immediately.
+- `endpoint`: `env::var("GRPC_ENDPOINT")` — panics (expect) if unset.
+- `api_token`: `env::var("GRPC_API_KEY").ok()`.
+- `commitment`: `CommitmentLevel::Processed`.
+- `max_decoding_message_size`: 1 GiB.
+- `reconnect_*`: as in table above.
+- `clickhouse_*`: from env; `.filter(|s| !s.is_empty())` so empty string is treated as unset.
 
 ---
 
-## Usage
+## Validation (validate())
 
-The binary builds `Config` via `Config::default()` and calls `validate()` in `main`. The same config is passed to the code that constructs the gRPC client and subscribes to Geyser; parsed updates are then broadcast over the WebSocket (see [client.md](client.md) and [ws_server.md](ws_server.md)).
+- `endpoint` must not be empty.
+- `endpoint` must start with `http://` or `https://`.
+
+Returns `anyhow::Result<()>`. Called in main before starting the server; invalid config exits the process.
 
 ---
 
-## See also
+## Where config is used
 
-- [client.md](client.md) — Uses `Config` to build and connect the gRPC client.
-- [README.md](README.md) — Environment variable reference table.
+- **main**: validation; WS_PORT from env separately (not in Config); backoff built from reconnect_*; passes config clone into retry closure.
+- **client**: endpoint, api_token, max_decoding_message_size, and endpoint scheme (https → TLS). See [client.md](client.md).
+- **handler**: received as argument; used only for `send_ping` (commitment and ping id). See [handler.md](handler.md).
+
+WS_PORT, WS_MAX_CONNECTIONS, WS_MAX_LAG_DROP are read in ws_server (WsConfig::default()) and in main (for port only); they are not fields of Config.

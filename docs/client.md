@@ -1,49 +1,37 @@
-# Geyser gRPC client
+# client.rs — Geyser gRPC client
 
 **Source:** `src/client.rs`
 
-This document describes how the data-pipeline connects to the Yellowstone Geyser gRPC service and how that connection is used to feed the WebSocket stream.
-
----
-
-## Purpose
-
-The client builds and connects a **Yellowstone Geyser gRPC client** using the configuration from [config.md](config.md). The pipeline subscribes to transaction streams for the programs it cares about (Pump.fun, Pump AMM); parsed token launches and trades are then serialized and pushed to all WebSocket clients via `WsServer::broadcast`.
+Builds and connects the Yellowstone Geyser gRPC client. All behaviour is described here; config is in [config.md](config.md).
 
 ---
 
 ## GrpcClient
 
-**Construction:** `GrpcClient::new(config)` creates a client that will use the given config for the connection.
-
-**Connection:** `connect(&self)` is an async function that returns a connected Geyser gRPC client (or an error). The caller uses this client to subscribe to transaction updates.
-
----
-
-## Connection logic (connect)
-
-1. **Builder:** The client is built from `config.endpoint` with `max_decoding_message_size` set from config (e.g. 1 GiB).
-
-2. **Authentication:** If `config.api_token` is set, the builder is configured with that token (e.g. via an interceptor or header).
-
-3. **TLS:** If the endpoint URL starts with `https://` (case-insensitive), the client is configured to use TLS with default roots (e.g. `ClientTlsConfig::new().with_native_roots()`).
-
-4. **Connect:** The builder’s `connect().await` is called. Errors are wrapped with `anyhow` and a clear message so the pipeline can log or retry.
+- **Struct:** holds `Config` (clone used for builder).
+- **`new(config: Config)`:** stores config.
 
 ---
 
-## How it fits in the pipeline
+## connect()
 
-The handler (or a dedicated task) typically:
+Returns `anyhow::Result<GeyserGrpcClient<impl Interceptor + Clone>>`. Used once per retry attempt in main.
 
-1. Constructs `GrpcClient::new(config)` with the same `Config` used in `main`.
-2. Calls `client.connect().await` and subscribes to the needed transaction filters (Pump.fun and Pump AMM program IDs).
-3. For each transaction update, parses instructions, extracts token launches and trades, enriches launches from same-tx data, then serializes the events (e.g. with MessagePack) and calls `ws_server.broadcast(message)` so every connected WebSocket client receives them.
+Steps:
+
+1. **Builder:** `GeyserGrpcClient::build_from_shared(config.endpoint)` — endpoint must be a valid http(s) URL. `.max_decoding_message_size(config.max_decoding_message_size)` — 1 GiB by default so large transactions don’t fail decode.
+2. **Auth:** If `config.api_token` is set, `.x_token(Some(token))` so the interceptor sends the token (e.g. as header or metadata).
+3. **TLS:** If `config.endpoint.to_lowercase().starts_with("https://")`, `.tls_config(ClientTlsConfig::new().with_native_roots())` so the connection is TLS. No client certs; native root store only.
+4. **Connect:** `.connect().await` — establishes the channel. Errors (DNS, TLS, connection refused) are wrapped in `anyhow`.
+
+So: one logical “connection” per call; main calls `connect()` each time the retry loop runs (after a disconnect or stream error). The returned client is used to create the subscribe stream; when the stream ends or errors, main drops it and calls `connect()` again after backoff.
 
 ---
 
-## See also
+## Dependencies
 
-- [config.md](config.md) — Source of `Config`.
-- [ws_server.md](ws_server.md) — `broadcast()` and how messages reach WebSocket clients.
-- [messages.md](messages.md) — Wire format of broadcast messages.
+- **crate::config::Config** — endpoint, api_token, max_decoding_message_size.
+- **yellowstone_grpc_client** — GeyserGrpcClient, ClientTlsConfig, Interceptor.
+- **anyhow::Context** — for error context.
+
+No other crate modules.

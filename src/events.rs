@@ -58,7 +58,7 @@ impl Default for PumpProtocolConstants {
 /// Pump.fun PDAs and accounts needed for transaction building (bonding curve phase).
 /// All addresses are base58 strings. Use these so frontend/backend can build Buy/Sell/Create
 /// without extra RPC for account resolution. For creator_vault and fee_config derivation
-/// see docs/pumpfun_accounts.md (seeds and program IDs).
+/// See docs/pumpfun_accounts.md for PDA seeds and program IDs.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct PumpFunBondingCurveAccounts {
     /// Bonding curve PDA: seeds ["bonding-curve", mint], program = Pump.fun

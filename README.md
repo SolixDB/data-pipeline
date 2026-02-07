@@ -44,7 +44,9 @@ The process stays running and serves WebSocket on `ws://0.0.0.0:<WS_PORT>` (defa
 | `WS_MAX_CONNECTIONS` | No | no limit | Max concurrent WebSocket clients; excess connections are rejected. |
 | `WS_MAX_LAG_DROP` | No | no disconnect | If a client drops ≥ this many messages in one lag event, disconnect them so they reconnect for fresh data. |
 | `RUST_LOG` | No | info | Log level (e.g. `debug`, `info`, `warn`). |
+| `CLICKHOUSE_URL` | No | — | If set, pipeline_metrics are written to ClickHouse. |
+| `CLICKHOUSE_USER` / `CLICKHOUSE_PASSWORD` | No | — | ClickHouse auth. |
 
-## Code documentation (for developers)
+## Code documentation
 
-**Detailed explanation of the entire Rust codebase** — types, control flow, design choices, and how modules fit together — lives in **[docs](docs/README.md)**.
+**[docs/README.md](docs/README.md)** is the index. It links to detailed split docs (main, config, client, handler, multi_parser, events, messages, ws_server, db, protocols, pumpfun_accounts, RUNBOOK). Each doc is self-contained so a new Rust dev can understand the codebase from these docs only.
