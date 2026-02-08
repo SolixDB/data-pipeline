@@ -1,8 +1,8 @@
-# db.rs — ClickHouse metrics
+# db.rs — ClickHouse client and tables
 
 **Source:** `src/db.rs`
 
-Single table `pipeline_metrics` for aggregate metrics (launch count, gRPC latency, server latency). Used only when `CLICKHOUSE_URL` is set. No other tables or features. All behaviour is described here.
+ClickHouse client factory, `pipeline_metrics` table (aggregate metrics), and storage tables `token_launches`, `trades`, `migrations` used by the storage worker. Also `drop_tables` for clear modes and `query_holder_stats` for holder analytics. Used only when a ClickHouse client is created (CLICKHOUSE_URL set and not SKIP_CLICKHOUSE). All behaviour is described here.
 
 ---
 
@@ -10,7 +10,11 @@ Single table `pipeline_metrics` for aggregate metrics (launch count, gRPC latenc
 
 - **make_client(url, user, password)** — build ClickHouse `Client`; optional user/password.
 - **ensure_table(client)** — create `pipeline_metrics` if not exists (ReplacingMergeTree(updated_at)).
-- **update_metrics_aggregates_optional(client, grpc_ms, server_us)** — if client is Some, read current metrics, update aggregates, insert new rows. Logs on error but does not return it (no-op or log).
+- **ensure_token_launches_table(client)**, **ensure_trades_table(client)**, **ensure_migrations_table(client)** — create storage tables if not exists (MergeTree, ORDER BY (mint, slot)).
+- **drop_tables(client)** — DROP TABLE IF EXISTS for pipeline_metrics, token_launches, trades, migrations. Used when CLEAR_CLICKHOUSE or CLEAR_CLICKHOUSE_ONLY.
+- **insert_token_launch(client, row)**, **insert_trade(client, row)**, **insert_migration(client, row)** — single-row inserts; used by storage worker.
+- **update_metrics_aggregates_optional(client, grpc_ms, server_us)** — if client is Some, read current metrics, update aggregates, insert new rows. Logs on error but does not return it (no-op or log). Used by handler.
+- **query_holder_stats(client, mint)** — returns (top10_pct, dev_pct, top10). Public API for holder stats; see [RUNBOOK.md](RUNBOOK.md).
 
 `get_current_metrics` and `update_metrics_aggregates` are used only inside this module.
 
@@ -22,15 +26,23 @@ Single table `pipeline_metrics` for aggregate metrics (launch count, gRPC latenc
 - If user: `.with_user(u)`.
 - If password: `.with_password(p)`.
 
-Returns the client; no connection test. main calls this once when building `metrics_client`; handler receives `Option<Arc<Client>>`.
+Returns the client; no connection test. main calls this once when building `metrics_client`; handler and storage worker receive `Option<Arc<Client>>`.
 
 ---
 
-## Table: pipeline_metrics
+## Tables
+
+### pipeline_metrics
 
 - **Columns:** `key` (LowCardinality(String)), `value` (Float64), `updated_at` (DateTime64(3, 'UTC')).
 - **Engine:** ReplacingMergeTree(updated_at), ORDER BY key.
 - **Semantics:** One row per metric key; ReplacingMergeTree keeps the row with latest `updated_at` per key after merges. So we use it as a key-value store with “last write wins”.
+
+### token_launches, trades, migrations
+
+- **Columns:** TokenLaunchRow, TradeRow, MigrationRow (signature, slot, mint, …; trades: direction, token_amount, sol_amount, virtual_token_reserves, is_create, pool; migrations: user, bonding_curve, pool, token_amount, sol_amount, fee).
+- **Engine:** MergeTree(), ORDER BY (mint, slot). trades has pool Nullable(String).
+- **Written by:** storage worker when ClickHouse client is set.
 
 ---
 
@@ -77,9 +89,20 @@ If `client` is None: do nothing. If Some: call `update_metrics_aggregates`; on e
 
 ---
 
+## Row types (storage)
+
+- **TokenLaunchRow:** signature, slot, mint, name, symbol, uri, creator, received_at, sent_at.
+- **TradeRow:** signature, slot, mint, trader, direction, token_amount, sol_amount, virtual_token_reserves, is_create, pool (Option), received_at, sent_at.
+- **MigrationRow:** signature, slot, mint, user, bonding_curve, pool, token_amount, sol_amount, fee, received_at, sent_at.
+
+**HolderBalanceRow** and **query_holder_stats** are documented in [RUNBOOK.md](RUNBOOK.md).
+
+---
+
 ## Where db is used
 
-- **main:** make_client, ensure_table when CLICKHOUSE_URL is set; passes metrics_client into handle_stream_updates.
+- **main:** make_client, ensure_table, ensure_token_launches_table, ensure_trades_table, ensure_migrations_table, drop_tables when ClickHouse is used; passes metrics_client into handle_stream_updates and storage worker.
 - **handler:** update_metrics_aggregates_optional for each launch (grpc_ms and server_us from that launch).
+- **storage:** insert_token_launch, insert_trade, insert_migration when ClickHouse client is set.
 
 No health checks or other endpoints; if ClickHouse is down, the insert fails and we log.

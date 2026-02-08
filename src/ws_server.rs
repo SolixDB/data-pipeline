@@ -1,13 +1,15 @@
 use crate::messages::{ConnectedPayload, ServerMessage};
+use crate::storage::SnapshotState;
 use bytes::Bytes;
 use futures_util::{SinkExt, StreamExt};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{broadcast, Semaphore};
+use tokio::sync::{broadcast, RwLock, Semaphore};
 use tokio_tungstenite::tungstenite::Message;
 use tracing::{error, info, warn};
+use redis::AsyncCommands;
 
 /// Broadcast channel capacity - handles burst traffic
 const BROADCAST_CAPACITY: usize = 4096;
@@ -57,20 +59,23 @@ enum ConnectionGuard {
 }
 
 pub struct WsServer {
-    /// Single-producer broadcast channel for O(1) message distribution (binary)
     broadcast_tx: broadcast::Sender<Bytes>,
-    /// Atomic counter for client IDs (no lock needed)
     next_id: AtomicU64,
-    /// Atomic client count for metrics (no lock on hot path)
     client_count: AtomicU64,
-    /// When set, new connections are rejected when at capacity
     semaphore: Option<Arc<Semaphore>>,
-    /// When set, disconnect clients that lag past this many dropped messages (trading: reconnect for fresh state)
     max_lag_drop: Option<u64>,
+    /// When set, on connect we send the four snapshots from this state (no Redis required).
+    snapshot_state: Option<Arc<RwLock<SnapshotState>>>,
+    /// When set and snapshot_state is None, on connect we send snapshots from Redis.
+    redis_client: Option<Arc<redis::Client>>,
 }
 
 impl WsServer {
-    pub fn new(config: WsConfig) -> Self {
+    pub fn new(
+        config: WsConfig,
+        snapshot_state: Option<Arc<RwLock<SnapshotState>>>,
+        redis_client: Option<Arc<redis::Client>>,
+    ) -> Self {
         let (broadcast_tx, _) = broadcast::channel(BROADCAST_CAPACITY);
         let semaphore = config
             .max_connections
@@ -82,6 +87,8 @@ impl WsServer {
             client_count: AtomicU64::new(0),
             semaphore,
             max_lag_drop: config.max_lag_drop,
+            snapshot_state,
+            redis_client,
         }
     }
 
@@ -191,6 +198,76 @@ async fn handle_connection(
     let welcome = ServerMessage::Connected(ConnectedPayload { client_id });
     let welcome_msg = rmp_serde::to_vec(&welcome).unwrap();
     ws_sender.send(Message::Binary(welcome_msg.into())).await?;
+
+    // Snapshot on connect: from in-memory state (no Redis) or from Redis when configured
+    if let Some(ref state) = server.snapshot_state {
+        // Avoid race: if snapshot is empty, give storage worker a short time to populate (e.g. first connect)
+        let mut snap = state.read().await.clone();
+        for attempt in 0..5 {
+            if !snap.launches.is_empty() {
+                break;
+            }
+            drop(snap);
+            tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+            snap = state.read().await.clone();
+            if attempt > 0 {
+                info!("Snapshot was empty, retry {} for client {}", attempt + 1, client_id);
+            }
+        }
+        info!(
+            "Sending snapshot to client {}: {} launches, {} trades",
+            client_id,
+            snap.launches.len(),
+            snap.trades.len()
+        );
+        if let Ok(bytes) = rmp_serde::to_vec(&ServerMessage::SnapshotMigrated(snap.migrated)) {
+            let _ = ws_sender.send(Message::Binary(bytes.into())).await;
+        }
+        if let Ok(bytes) = rmp_serde::to_vec(&ServerMessage::SnapshotSoonMigrating(snap.soon_migrating)) {
+            let _ = ws_sender.send(Message::Binary(bytes.into())).await;
+        }
+        if let Ok(bytes) = rmp_serde::to_vec(&ServerMessage::SnapshotLaunches(snap.launches.clone())) {
+            let _ = ws_sender.send(Message::Binary(bytes.into())).await;
+        }
+        if let Ok(bytes) = rmp_serde::to_vec(&ServerMessage::SnapshotTrades(snap.trades)) {
+            let _ = ws_sender.send(Message::Binary(bytes.into())).await;
+        }
+    } else if let Some(ref redis) = server.redis_client {
+        if let Ok(mut conn) = redis.get_multiplexed_async_connection().await {
+            let migrated: Result<String, _> = conn.get(crate::storage::REDIS_KEY_MIGRATED).await;
+            let soon: Result<String, _> = conn.get(crate::storage::REDIS_KEY_SOON_MIGRATING).await;
+            if let Ok(json) = migrated {
+                if let Ok(entries) = serde_json::from_str::<Vec<crate::storage::MigratedEntry>>(&json) {
+                    if let Ok(bytes) = rmp_serde::to_vec(&ServerMessage::SnapshotMigrated(entries)) {
+                        let _ = ws_sender.send(Message::Binary(bytes.into())).await;
+                    }
+                }
+            }
+            if let Ok(json) = soon {
+                if let Ok(entries) = serde_json::from_str::<Vec<crate::storage::SoonMigratingEntry>>(&json) {
+                    if let Ok(bytes) = rmp_serde::to_vec(&ServerMessage::SnapshotSoonMigrating(entries)) {
+                        let _ = ws_sender.send(Message::Binary(bytes.into())).await;
+                    }
+                }
+            }
+            let launches: Result<String, _> = conn.get(crate::storage::REDIS_KEY_LAUNCHES).await;
+            let trades: Result<String, _> = conn.get(crate::storage::REDIS_KEY_TRADES).await;
+            if let Ok(json) = launches {
+                if let Ok(entries) = serde_json::from_str::<Vec<crate::messages::TokenLaunchPayload>>(&json) {
+                    if let Ok(bytes) = rmp_serde::to_vec(&ServerMessage::SnapshotLaunches(entries)) {
+                        let _ = ws_sender.send(Message::Binary(bytes.into())).await;
+                    }
+                }
+            }
+            if let Ok(json) = trades {
+                if let Ok(entries) = serde_json::from_str::<Vec<crate::events::Trade>>(&json) {
+                    if let Ok(bytes) = rmp_serde::to_vec(&ServerMessage::SnapshotTrades(entries)) {
+                        let _ = ws_sender.send(Message::Binary(bytes.into())).await;
+                    }
+                }
+            }
+        }
+    }
 
     // Event loop: receive from broadcast channel and handle client messages
     loop {

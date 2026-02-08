@@ -17,9 +17,13 @@ Config is loaded from the environment and validated at startup. This doc lists e
 | `reconnect_initial_interval_ms` | `u64` | — | Fixed: 500. First backoff delay when gRPC stream fails. |
 | `reconnect_max_interval_ms` | `u64` | — | Fixed: 30000. Cap on backoff interval. |
 | `reconnect_max_elapsed_time_ms` | `Option<u64>` | — | Fixed: None. If set, backoff would stop after this total time. |
-| `clickhouse_url` | `Option<String>` | `CLICKHOUSE_URL` | If set and non-empty, ClickHouse client is created and metrics are written. |
+| `clickhouse_url` | `Option<String>` | `CLICKHOUSE_URL` | If set and non-empty (and not skip_clickhouse), ClickHouse client is created; metrics and storage writes. |
 | `clickhouse_user` | `Option<String>` | `CLICKHOUSE_USER` | Optional; empty string filtered out. |
 | `clickhouse_password` | `Option<String>` | `CLICKHOUSE_PASSWORD` | Optional; empty string filtered out. |
+| `redis_url` | `Option<String>` | `REDIS_URL` | Optional. When set, storage worker writes snapshot keys (migrated, soon_migrating, launches, trades); WS server can send snapshots from Redis when in-memory state is not used. |
+| `clear_clickhouse` | `bool` | `CLEAR_CLICKHOUSE` | When true (1/true/yes), drop and recreate all pipeline ClickHouse tables on startup. Requires CLICKHOUSE_URL. |
+| `skip_clickhouse` | `bool` | `SKIP_CLICKHOUSE` | When true (1/true/yes), no ClickHouse client; no metrics or storage writes. Redis and WebSocket unchanged. |
+| `clear_clickhouse_only` | `bool` | `CLEAR_CLICKHOUSE_ONLY` | When true (1/true/yes), connect to ClickHouse, drop and recreate tables, then set client to None for the rest of the run (no further writes). Requires CLICKHOUSE_URL. |
 
 ---
 
@@ -31,6 +35,8 @@ Config is loaded from the environment and validated at startup. This doc lists e
 - `max_decoding_message_size`: 1 GiB.
 - `reconnect_*`: as in table above.
 - `clickhouse_*`: from env; `.filter(|s| !s.is_empty())` so empty string is treated as unset.
+- `redis_url`: from env `REDIS_URL`; empty filtered out.
+- `clear_clickhouse`, `skip_clickhouse`, `clear_clickhouse_only`: from env (1/true/yes → true).
 
 ---
 
@@ -38,6 +44,8 @@ Config is loaded from the environment and validated at startup. This doc lists e
 
 - `endpoint` must not be empty.
 - `endpoint` must start with `http://` or `https://`.
+- If `clear_clickhouse` is true and `skip_clickhouse` is false, `clickhouse_url` must be set (non-empty).
+- If `clear_clickhouse_only` is true, `clickhouse_url` must be set (non-empty).
 
 Returns `anyhow::Result<()>`. Called in main before starting the server; invalid config exits the process.
 
@@ -45,7 +53,7 @@ Returns `anyhow::Result<()>`. Called in main before starting the server; invalid
 
 ## Where config is used
 
-- **main**: validation; WS_PORT from env separately (not in Config); backoff built from reconnect_*; passes config clone into retry closure.
+- **main**: validation; WS_PORT from env separately (not in Config); backoff built from reconnect_*; passes config clone into retry closure; uses redis_url for Redis client and storage worker; uses clickhouse_* and clear/skip flags for ClickHouse client lifecycle.
 - **client**: endpoint, api_token, max_decoding_message_size, and endpoint scheme (https → TLS). See [client.md](client.md).
 - **handler**: received as argument; used only for `send_ping` (commitment and ping id). See [handler.md](handler.md).
 

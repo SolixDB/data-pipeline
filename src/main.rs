@@ -6,6 +6,7 @@ mod handler;
 mod messages;
 mod protocols;
 mod multi_parser;
+mod storage;
 mod ws_server;
 
 use anyhow::Context;
@@ -17,7 +18,9 @@ use futures_util::TryFutureExt;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::RwLock;
 use tracing::{error, info, warn};
+use storage::SnapshotState;
 use ws_server::WsServer;
 use yellowstone_grpc_proto::prelude::{
     SubscribeRequest, SubscribeRequestFilterTransactions,
@@ -42,6 +45,7 @@ async fn main() -> anyhow::Result<()> {
 
     let config = Config::default();
     config.validate()?;
+    let config_arc = Arc::new(config);
 
     let ws_port: u16 = std::env::var("WS_PORT")
         .ok()
@@ -49,27 +53,60 @@ async fn main() -> anyhow::Result<()> {
         .unwrap_or(5566);
 
     let ws_config = ws_server::WsConfig::default();
-    let ws_server = Arc::new(WsServer::new(ws_config));
+    let snapshot_state = Arc::new(RwLock::new(SnapshotState::default()));
+    let redis_client: Option<Arc<redis::Client>> = config_arc
+        .redis_url
+        .as_ref()
+        .and_then(|url| redis::Client::open(url.as_str()).ok())
+        .map(Arc::new);
+    let ws_server = Arc::new(WsServer::new(ws_config, Some(snapshot_state.clone()), redis_client));
     let ws_handle = ws_server.start(ws_port).await;
 
-    let config_arc = Arc::new(config);
     let client = Arc::new(GrpcClient::new((*config_arc).clone()));
 
-    let metrics_client: Option<Arc<clickhouse::Client>> = config_arc
-        .clickhouse_url
-        .as_ref()
-        .map(|url| {
-            let c = db::make_client(
-                url,
-                config_arc.clickhouse_user.as_deref(),
-                config_arc.clickhouse_password.as_deref(),
-            );
-            Arc::new(c)
-        });
+    let mut metrics_client: Option<Arc<clickhouse::Client>> = if config_arc.skip_clickhouse {
+        info!("ClickHouse disabled (SKIP_CLICKHOUSE=1)");
+        None
+    } else {
+        config_arc
+            .clickhouse_url
+            .as_ref()
+            .map(|url| {
+                let c = db::make_client(
+                    url,
+                    config_arc.clickhouse_user.as_deref(),
+                    config_arc.clickhouse_password.as_deref(),
+                );
+                Arc::new(c)
+            })
+    };
     if let Some(ref c) = metrics_client {
         db::ensure_table(c.as_ref()).await.map_err(|e| anyhow::anyhow!("ClickHouse ensure_table: {}", e))?;
+        db::ensure_token_launches_table(c.as_ref()).await.map_err(|e| anyhow::anyhow!("ClickHouse token_launches: {}", e))?;
+        db::ensure_trades_table(c.as_ref()).await.map_err(|e| anyhow::anyhow!("ClickHouse trades: {}", e))?;
+        db::ensure_migrations_table(c.as_ref()).await.map_err(|e| anyhow::anyhow!("ClickHouse migrations: {}", e))?;
+        if config_arc.clear_clickhouse || config_arc.clear_clickhouse_only {
+            db::drop_tables(c.as_ref()).await.map_err(|e| anyhow::anyhow!("ClickHouse drop_tables: {}", e))?;
+            db::ensure_table(c.as_ref()).await.map_err(|e| anyhow::anyhow!("ClickHouse ensure_table: {}", e))?;
+            db::ensure_token_launches_table(c.as_ref()).await.map_err(|e| anyhow::anyhow!("ClickHouse token_launches: {}", e))?;
+            db::ensure_trades_table(c.as_ref()).await.map_err(|e| anyhow::anyhow!("ClickHouse trades: {}", e))?;
+            db::ensure_migrations_table(c.as_ref()).await.map_err(|e| anyhow::anyhow!("ClickHouse migrations: {}", e))?;
+            info!("ClickHouse tables dropped and recreated");
+        }
+        if config_arc.clear_clickhouse_only {
+            info!("ClickHouse cleared; not storing further data (CLEAR_CLICKHOUSE_ONLY=1)");
+            metrics_client = None;
+        }
     }
     let metrics_client_for_handler = metrics_client.clone();
+
+    let (storage_tx, storage_rx) = tokio::sync::mpsc::channel(50_000);
+    storage::spawn_storage_worker(
+        storage_rx,
+        metrics_client.clone(),
+        config_arc.redis_url.clone(),
+        Some(snapshot_state),
+    );
 
     let backoff = ExponentialBackoff {
         initial_interval: Duration::from_millis(config_arc.reconnect_initial_interval_ms),
@@ -95,11 +132,13 @@ async fn main() -> anyhow::Result<()> {
         rx
     };
 
+    let storage_tx_for_retry = storage_tx.clone();
     let run = future::retry(backoff, move || {
         let client = Arc::clone(&client);
         let config = Arc::clone(&config_arc);
         let ws_server = Arc::clone(&ws_server);
         let metrics_client = metrics_client_for_handler.clone();
+        let storage_tx = storage_tx_for_retry.clone();
         let mut shutdown_rx = shutdown_rx.clone();
 
         async move {
@@ -152,7 +191,7 @@ async fn main() -> anyhow::Result<()> {
                 .context("subscribe")?;
 
             tokio::select! {
-                result = handle_stream_updates(stream, subscribe_tx, (*config).clone(), ws_server, parser_map, metrics_client) => {
+                result = handle_stream_updates(stream, subscribe_tx, (*config).clone(), ws_server, parser_map, metrics_client, storage_tx) => {
                     result.map_err(|e| {
                         error!("Stream: {}", e);
                         BackoffError::transient(e)

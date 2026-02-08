@@ -25,10 +25,13 @@ The binary subscribes to a Solana Geyser gRPC stream (Yellowstone), filters for 
 | [events.md](events.md) | Domain types: TokenLaunch, Trade, Migration, BondingCurveState, PumpFunBondingCurveAccounts, PumpProtocolConstants, TradeDirection. Field-by-field. |
 | [messages.md](messages.md) | Wire format: ServerMessage, TokenLaunchPayload, ConnectedPayload. MessagePack, when each message is sent, payload fields. |
 | [ws_server.md](ws_server.md) | WsConfig, WsServer, broadcast channel, accept loop, handle_connection, connection limit, lag disconnect. |
-| [db.md](db.md) | ClickHouse client, pipeline_metrics table, metric keys, get_current_metrics, update_metrics_aggregates, update_metrics_aggregates_optional. |
+| [db.md](db.md) | ClickHouse client, pipeline_metrics and storage tables (token_launches, trades, migrations), drop_tables, insert_*, query_holder_stats. |
+| [storage.md](storage.md) | Storage worker: channel consumer, ClickHouse writes, SnapshotState (migrated, soon_migrating, last 50 launches, their trades), optional Redis. |
 | [protocols.md](protocols.md) | pump_fun: Create/trade/migration detection and parsing (logs + instruction data). pump_amm: AMM buy/sell event layout and parsing. |
 | [pumpfun_accounts.md](pumpfun_accounts.md) | Program IDs, PDA seeds, Create/Buy/Sell account order, what the pipeline sends vs what you derive. For building transactions. |
-| [RUNBOOK.md](RUNBOOK.md) | Operations: how to confirm gRPC/data flow, ClickHouse, parse errors, WebSocket clients. |
+| [RUNBOOK.md](RUNBOOK.md) | Operations: gRPC/data flow, ClickHouse (tables, CLEAR/SKIP/CLEAR_ONLY), parse errors, WebSocket clients. |
+
+**Storage and snapshots:** Handler sends each launch/trade/migration to a bounded channel (non-blocking). The storage worker writes to ClickHouse when a client is set and updates in-memory SnapshotState (migrated, soon_migrating, last 50 launches, their trades). On WebSocket connect the server sends the four snapshots so clients see migrated/soon-migrating columns even if they weren’t connected during those events. See [storage.md](storage.md) and [messages.md](messages.md).
 
 **New to the codebase:** Start with [main.md](main.md) for the big picture, then [handler.md](handler.md) and [multi_parser.md](multi_parser.md) for the data path. Use [messages.md](messages.md) and [pumpfun_accounts.md](pumpfun_accounts.md) when integrating clients or building Pump.fun transactions.
 
@@ -36,17 +39,103 @@ The binary subscribes to a Solana Geyser gRPC stream (Yellowstone), filters for 
 
 ## How to run
 
+**Prerequisites:** Rust (e.g. `rustup default stable`), a Solana Geyser gRPC endpoint. From the repo root, run from the `data-pipeline` directory.
+
+**Required env:** `GRPC_ENDPOINT` (Geyser gRPC URL, e.g. `https://your-rpc.example.com`).
+
+### Minimal (WebSocket only, no persistence)
+
+No ClickHouse or Redis; snapshots come from in-memory state. Good for testing.
+
 ```bash
 cd data-pipeline
 export GRPC_ENDPOINT="https://your-geyser-endpoint"
-# optional: GRPC_API_KEY, WS_PORT, WS_MAX_CONNECTIONS, WS_MAX_LAG_DROP, CLICKHOUSE_URL, CLICKHOUSE_USER, CLICKHOUSE_PASSWORD, RUST_LOG
 cargo run --release
 ```
 
-WebSocket: `ws://0.0.0.0:5566` (or your `WS_PORT`). Logs: `Connected to blockchain gRPC`, `WebSocket server listening on ws://...`, and per-event lines (LAUNCH, BUY/SELL, MIGRATE).
+WebSocket: `ws://0.0.0.0:5566`. Optional: `GRPC_API_KEY`, `WS_PORT`, `RUST_LOG`.
+
+### With ClickHouse (save launches, trades, migrations)
+
+Persist to ClickHouse; snapshots still in-memory (Redis optional).
+
+```bash
+cd data-pipeline
+export GRPC_ENDPOINT="https://your-geyser-endpoint"
+export CLICKHOUSE_URL="http://localhost:8123"
+# optional: CLICKHOUSE_USER, CLICKHOUSE_PASSWORD
+cargo run --release
+```
+
+### With Redis (snapshot cache)
+
+When you set `REDIS_URL`, the storage worker also writes snapshot keys to Redis. Useful if you run multiple instances or want snapshots to survive restarts.
+
+```bash
+cd data-pipeline
+export GRPC_ENDPOINT="https://your-geyser-endpoint"
+export CLICKHOUSE_URL="http://localhost:8123"
+export REDIS_URL="redis://127.0.0.1:6379"
+cargo run --release
+```
+
+### Dev: clear ClickHouse on every start
+
+Drop and recreate all pipeline tables on startup so schema and data match the current code.
+
+```bash
+export GRPC_ENDPOINT="https://your-geyser-endpoint"
+export CLICKHOUSE_URL="http://localhost:8123"
+export CLEAR_CLICKHOUSE=1
+export RUST_LOG=info
+cargo run --release
+```
+
+### Dev: clear ClickHouse once, then don’t save
+
+Connect to ClickHouse, drop and recreate tables, then run without writing any data (WebSocket and in-memory snapshots only).
+
+```bash
+export GRPC_ENDPOINT="https://your-geyser-endpoint"
+export CLICKHOUSE_URL="http://localhost:8123"
+export CLEAR_CLICKHOUSE_ONLY=1
+export RUST_LOG=info
+cargo run --release
+```
+
+### No ClickHouse (Redis + WebSocket only)
+
+Disable ClickHouse entirely; no metrics or storage writes.
+
+```bash
+export GRPC_ENDPOINT="https://your-geyser-endpoint"
+export REDIS_URL="redis://127.0.0.1:6379"
+export SKIP_CLICKHOUSE=1
+cargo run --release
+```
+
+### All optional env vars
+
+| Env | Default | Description |
+|-----|---------|-------------|
+| `GRPC_ENDPOINT` | (required) | Geyser gRPC URL. |
+| `GRPC_API_KEY` | — | Optional gRPC auth token. |
+| `WS_PORT` | 5566 | WebSocket listen port. |
+| `WS_MAX_CONNECTIONS` | 0 (unlimited) | Max concurrent WS clients. |
+| `WS_MAX_LAG_DROP` | 0 (off) | Disconnect client if it lags this many messages. |
+| `CLICKHOUSE_URL` | — | ClickHouse HTTP URL (e.g. `http://localhost:8123`). |
+| `CLICKHOUSE_USER` | — | ClickHouse user. |
+| `CLICKHOUSE_PASSWORD` | — | ClickHouse password. |
+| `REDIS_URL` | — | Redis URL for snapshot cache (e.g. `redis://127.0.0.1:6379`). |
+| `CLEAR_CLICKHOUSE` | 0 | Set to 1 to drop and recreate ClickHouse tables on startup. |
+| `SKIP_CLICKHOUSE` | 0 | Set to 1 to disable ClickHouse (no connect, no writes). |
+| `CLEAR_CLICKHOUSE_ONLY` | 0 | Set to 1 to clear tables then run without saving. |
+| `RUST_LOG` | info | Log level (e.g. `debug`, `info`). |
+
+After start: WebSocket at `ws://0.0.0.0:<WS_PORT>`. Logs: `Connected to blockchain gRPC`, `WebSocket server listening on ws://...`. Per-event lines are at `debug` level; use `RUST_LOG=debug` to see them.
 
 ---
 
 ## Architecture (one paragraph)
 
-**main** builds config, optional ClickHouse client (and ensures `pipeline_metrics` table), starts the WebSocket server, then runs a retry loop: connect gRPC (**client**), build **multi_parser**’s program-id map, subscribe to transactions that include Pump.fun and Pump AMM program IDs, and run **handler**’s `handle_stream_updates` on the stream. **handler** parses each transaction into instructions, calls **multi_parser** to get launches/trades/migrations and enriches launches; for each event it optionally writes metrics (**db**), serializes to MessagePack (**messages**), and broadcasts via **ws_server**. **multi_parser** delegates to **protocols** (pump_fun, pump_amm) for Create/trade/migration parsing. All types are in **events** and **messages**.
+**main** builds config, snapshot state, and optional Redis; starts the WebSocket server (with snapshot state and optional Redis). It builds an optional ClickHouse client (unless SKIP_CLICKHOUSE), ensures pipeline_metrics and storage tables; if CLEAR_CLICKHOUSE or CLEAR_CLICKHOUSE_ONLY it drops and recreates them; if CLEAR_CLICKHOUSE_ONLY it then sets the client to None. It spawns the **storage** worker (channel, ClickHouse, redis_url, snapshot state), then runs a retry loop: connect gRPC (**client**), build **multi_parser**’s program-id map, subscribe to transactions that include Pump.fun and Pump AMM program IDs, and run **handler**’s `handle_stream_updates` on the stream. **handler** parses transactions, sends events to **storage**, optionally writes metrics (**db**), serializes to MessagePack (**messages**), and broadcasts via **ws_server**. **storage** writes to ClickHouse and updates snapshot state (and optionally Redis). **ws_server** sends the four snapshots on each new client connect. **multi_parser** delegates to **protocols** (pump_fun, pump_amm) for Create/trade/migration parsing. All types are in **events** and **messages**.
