@@ -3,6 +3,7 @@ mod config;
 mod db;
 mod events;
 mod handler;
+mod health;
 mod messages;
 mod protocols;
 mod multi_parser;
@@ -106,6 +107,8 @@ async fn main() -> anyhow::Result<()> {
         metrics_client.clone(),
         config_arc.redis_url.clone(),
         Some(snapshot_state),
+        config_arc.snapshot_launch_limit,
+        config_arc.snapshot_trade_limit,
     );
 
     let backoff = ExponentialBackoff {
@@ -121,6 +124,13 @@ async fn main() -> anyhow::Result<()> {
     info!("gRPC endpoint: {}", config_arc.endpoint);
     info!("WebSocket ws://0.0.0.0:{}", ws_port);
 
+    let health_state = Arc::new(health::HealthState::new());
+    health::spawn_health_server(
+        config_arc.health_port,
+        config_arc.health_grpc_max_age_secs,
+        Arc::clone(&health_state),
+    );
+
     let shutdown_rx = {
         let (tx, rx) = tokio::sync::watch::channel(false);
         let _tx = tx.clone();
@@ -133,12 +143,14 @@ async fn main() -> anyhow::Result<()> {
     };
 
     let storage_tx_for_retry = storage_tx.clone();
+    let health_state_for_retry = Arc::clone(&health_state);
     let run = future::retry(backoff, move || {
         let client = Arc::clone(&client);
         let config = Arc::clone(&config_arc);
         let ws_server = Arc::clone(&ws_server);
         let metrics_client = metrics_client_for_handler.clone();
         let storage_tx = storage_tx_for_retry.clone();
+        let health_state = Arc::clone(&health_state_for_retry);
         let mut shutdown_rx = shutdown_rx.clone();
 
         async move {
@@ -148,6 +160,7 @@ async fn main() -> anyhow::Result<()> {
 
             let mut grpc = client.connect().await?;
             info!("Connected to blockchain gRPC");
+            health_state.record_activity();
 
             if *shutdown_rx.borrow() {
                 return Err(BackoffError::Permanent(anyhow::anyhow!("Shutdown")));
@@ -191,7 +204,7 @@ async fn main() -> anyhow::Result<()> {
                 .context("subscribe")?;
 
             tokio::select! {
-                result = handle_stream_updates(stream, subscribe_tx, (*config).clone(), ws_server, parser_map, metrics_client, storage_tx) => {
+                result = handle_stream_updates(stream, subscribe_tx, (*config).clone(), ws_server, parser_map, metrics_client, storage_tx, Some(health_state)) => {
                     result.map_err(|e| {
                         error!("Stream: {}", e);
                         BackoffError::transient(e)

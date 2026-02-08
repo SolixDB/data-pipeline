@@ -1,6 +1,7 @@
 use crate::config::Config;
 use crate::db;
 use crate::events::TradeDirection;
+use crate::health::HealthState;
 use crate::messages::{ServerMessage, TokenLaunchPayload};
 use crate::multi_parser;
 use crate::storage::StorageMessage;
@@ -25,6 +26,7 @@ pub async fn handle_stream_updates(
     parser_map: Arc<HashMap<Vec<u8>, &'static str>>,
     metrics_client: Option<Arc<clickhouse::Client>>,
     storage_tx: mpsc::Sender<StorageMessage>,
+    health_state: Option<Arc<HealthState>>,
 ) -> anyhow::Result<()> {
     let mut last_ping = std::time::Instant::now();
     let ping_interval = std::time::Duration::from_secs(30);
@@ -46,6 +48,7 @@ pub async fn handle_stream_updates(
                             ws_server.as_ref(),
                             metrics_client.as_ref().map(Arc::as_ref),
                             &storage_tx,
+                            health_state.as_deref(),
                         )
                         .await
                         {
@@ -80,7 +83,11 @@ async fn handle_transaction(
     ws_server: &WsServer,
     metrics_client: Option<&clickhouse::Client>,
     storage_tx: &mpsc::Sender<StorageMessage>,
+    health_state: Option<&HealthState>,
 ) -> anyhow::Result<()> {
+    if let Some(h) = health_state {
+        h.record_activity();
+    }
     let instructions = InstructionUpdate::parse_from_txn(tx_update)
         .map_err(|e| anyhow::anyhow!("parse_from_txn: {:?}", e))?;
     let received_at = unix_timestamp_micros();
@@ -117,9 +124,8 @@ async fn handle_transaction(
         let server_us = (launch.sent_at - received_at) as f64;
         db::update_metrics_aggregates_optional(metrics_client, grpc_ms, server_us).await;
 
-        if storage_tx.try_send(StorageMessage::TokenLaunch(launch.clone())).is_err() {
-            tracing::warn!("Storage channel full, dropping TokenLaunch");
-        }
+        storage_tx.send(StorageMessage::TokenLaunch(launch.clone())).await
+            .map_err(|_| anyhow::anyhow!("Storage channel closed"))?;
 
         let payload = TokenLaunchPayload {
             signature: launch.signature,
@@ -161,9 +167,8 @@ async fn handle_transaction(
         if let Ok(bytes) = rmp_serde::to_vec(&ServerMessage::Trade(trade.clone())) {
             ws_server.broadcast(bytes);
         }
-        if storage_tx.try_send(StorageMessage::Trade(trade)).is_err() {
-            tracing::warn!("Storage channel full, dropping Trade");
-        }
+        storage_tx.send(StorageMessage::Trade(trade)).await
+            .map_err(|_| anyhow::anyhow!("Storage channel closed"))?;
         debug!("{} | clients={}", log_msg, ws_server.client_count());
     }
 
@@ -180,9 +185,8 @@ async fn handle_transaction(
         if let Ok(bytes) = rmp_serde::to_vec(&ServerMessage::Migration(migration.clone())) {
             ws_server.broadcast(bytes);
         }
-        if storage_tx.try_send(StorageMessage::Migration(migration)).is_err() {
-            tracing::warn!("Storage channel full, dropping Migration");
-        }
+        storage_tx.send(StorageMessage::Migration(migration)).await
+            .map_err(|_| anyhow::anyhow!("Storage channel closed"))?;
         debug!("{} | clients={}", log_msg, ws_server.client_count());
     }
 

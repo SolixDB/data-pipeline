@@ -21,6 +21,14 @@ pub struct Config {
     pub skip_clickhouse: bool,
     /// When true, clear ClickHouse (drop + recreate tables) then do not write any data this run.
     pub clear_clickhouse_only: bool,
+    /// HTTP health server port; 0 = disabled.
+    pub health_port: u16,
+    /// Health returns 200 only if last gRPC activity is within this many seconds.
+    pub health_grpc_max_age_secs: u64,
+    /// Max token launches in WS connect snapshot.
+    pub snapshot_launch_limit: usize,
+    /// Max trades (for those mints) in WS connect snapshot.
+    pub snapshot_trade_limit: usize,
 }
 
 impl Default for Config {
@@ -50,6 +58,22 @@ impl Default for Config {
                 .ok()
                 .map(|s| matches!(s.to_lowercase().as_str(), "1" | "true" | "yes"))
                 .unwrap_or(false),
+            health_port: env::var("HEALTH_PORT")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(5567),
+            health_grpc_max_age_secs: env::var("HEALTH_GRPC_MAX_AGE_SECS")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(120),
+            snapshot_launch_limit: env::var("WS_INITIAL_SNAPSHOT_LAUNCH_LIMIT")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(50),
+            snapshot_trade_limit: env::var("WS_INITIAL_SNAPSHOT_TRADE_LIMIT")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(1000),
         }
     }
 }
