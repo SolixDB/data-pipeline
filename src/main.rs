@@ -125,7 +125,7 @@ async fn main() -> anyhow::Result<()> {
     info!("WebSocket ws://0.0.0.0:{}", ws_port);
 
     let health_state = Arc::new(health::HealthState::new());
-    health_state.record_activity(); // healthy from startup until max_age after last gRPC activity
+    health_state.record_activity();
     health::spawn_health_server(
         config_arc.health_port,
         config_arc.health_grpc_max_age_secs,

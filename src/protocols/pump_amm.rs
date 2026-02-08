@@ -1,8 +1,4 @@
-//! Pump AMM (pAMMBay...) Buy/Sell on migrated tokens.
-//! Parses buyEvent and sellEvent from "Program data: " logs; mint/pool/user from instruction accounts.
-
 use yellowstone_vixen_core::instruction::InstructionUpdate;
-
 use crate::events::{Trade, TradeDirection};
 
 /// Minimum size after 8-byte discriminator for buyEvent/sellEvent (through user pubkey at 144).
