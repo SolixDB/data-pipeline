@@ -13,6 +13,14 @@ pub struct Config {
     pub clickhouse_url: Option<String>,
     pub clickhouse_user: Option<String>,
     pub clickhouse_password: Option<String>,
+    #[allow(dead_code)] // read from main.rs (redis client, storage worker)
+    pub redis_url: Option<String>,
+    /// When true, TRUNCATE pipeline ClickHouse tables on startup (for dev).
+    pub clear_clickhouse: bool,
+    /// When true, do not connect or write to ClickHouse (Redis/WS still work).
+    pub skip_clickhouse: bool,
+    /// When true, clear ClickHouse (drop + recreate tables) then do not write any data this run.
+    pub clear_clickhouse_only: bool,
 }
 
 impl Default for Config {
@@ -29,6 +37,19 @@ impl Default for Config {
             clickhouse_url: env::var("CLICKHOUSE_URL").ok().filter(|s| !s.is_empty()),
             clickhouse_user: env::var("CLICKHOUSE_USER").ok().filter(|s| !s.is_empty()),
             clickhouse_password: env::var("CLICKHOUSE_PASSWORD").ok().filter(|s| !s.is_empty()),
+            redis_url: env::var("REDIS_URL").ok().filter(|s| !s.is_empty()),
+            clear_clickhouse: env::var("CLEAR_CLICKHOUSE")
+                .ok()
+                .map(|s| matches!(s.to_lowercase().as_str(), "1" | "true" | "yes"))
+                .unwrap_or(false),
+            skip_clickhouse: env::var("SKIP_CLICKHOUSE")
+                .ok()
+                .map(|s| matches!(s.to_lowercase().as_str(), "1" | "true" | "yes"))
+                .unwrap_or(false),
+            clear_clickhouse_only: env::var("CLEAR_CLICKHOUSE_ONLY")
+                .ok()
+                .map(|s| matches!(s.to_lowercase().as_str(), "1" | "true" | "yes"))
+                .unwrap_or(false),
         }
     }
 }
@@ -40,6 +61,12 @@ impl Config {
         } 
         if !self.endpoint.starts_with("http://") && !self.endpoint.starts_with("https://") {
             anyhow::bail!("Endpoint must start with http:// or https://");
+        }
+        if self.clear_clickhouse && !self.skip_clickhouse && self.clickhouse_url.as_ref().map_or(true, |u| u.is_empty()) {
+            anyhow::bail!("CLEAR_CLICKHOUSE is set but CLICKHOUSE_URL is missing or empty");
+        }
+        if self.clear_clickhouse_only && self.clickhouse_url.as_ref().map_or(true, |u| u.is_empty()) {
+            anyhow::bail!("CLEAR_CLICKHOUSE_ONLY is set but CLICKHOUSE_URL is missing or empty");
         }
         Ok(())
     }

@@ -20,7 +20,7 @@ publish = false
 
 [workspace.dependencies]
 # Core Utilities
-anyhow = "1"
+anyhow = "1.0.101"
 backoff = { version = "0.4", features = ["futures", "tokio"] }
 clap = { version = "4.5.57", features = ["derive", "cargo", "wrap_help"] }
 serde = { version = "1.0", features = ["derive"] }
@@ -80,6 +80,9 @@ yellowstone-vixen-proc-macro = { path = "crates/proc-macro", version = "0.1.0" }
 
 # Metrics (ClickHouse only; API server is separate)
 clickhouse = { version = "0.14", features = ["rustls-tls"] }
+
+# Snapshot cache for WS connect (migrated / soon_migrating)
+redis = { version = "1.0.3", features = ["tokio-comp", "connection-manager"] }
 
 [dependencies]
 # Core Utilities
@@ -143,3 +146,6 @@ yellowstone-vixen-proc-macro.workspace = true
 
 # Metrics (ClickHouse)
 clickhouse.workspace = true
+
+# Redis (snapshot cache)
+redis.workspace = true

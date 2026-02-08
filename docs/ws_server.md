@@ -2,7 +2,7 @@
 
 **Source:** `src/ws_server.rs`
 
-Single broadcast channel; each client gets the same stream of binary (MessagePack) frames. Handles accept loop, connection limit, lag-based disconnect, and ping/pong. All behaviour is described here; message types are in [messages.md](messages.md).
+Single broadcast channel; each client gets the same stream of binary (MessagePack) frames. Handles accept loop, connection limit, lag-based disconnect, ping/pong, and snapshot-on-connect (in-memory or Redis). All behaviour is described here; message types are in [messages.md](messages.md).
 
 ---
 
@@ -20,6 +20,8 @@ Single broadcast channel; each client gets the same stream of binary (MessagePac
 - **client_count:** AtomicU64 — current number of connected clients.
 - **semaphore:** Option<Arc<Semaphore>> — when set, try_acquire_owned() before accepting; reject when at capacity.
 - **max_lag_drop:** Option<u64> — when set, if a client’s recv returns Lagged(n) and n >= this, disconnect that client.
+- **snapshot_state:** Option<Arc<RwLock<SnapshotState>>> — when set, on connect we send the four snapshots from this in-memory state (updated by storage worker). See [storage.md](storage.md).
+- **redis_client:** Option<Arc<redis::Client>> — when snapshot_state is None and this is set, snapshots are read from Redis (snapshot:migrated, snapshot:soon_migrating, snapshot:launches, snapshot:trades).
 
 ---
 
@@ -49,21 +51,24 @@ Returns client_count.load(Relaxed). Used for logs (“clients=N”).
 2. tokio_tungstenite::accept_async(stream) — WebSocket handshake.
 3. Split into sender/receiver. Allocate client_id (next_id.fetch_add(1)+1), subscribe() to broadcast (new receiver for this client), increment client_count, log “Client X connected (Y total)”.
 4. Send one ServerMessage::Connected(ConnectedPayload { client_id }) as MessagePack binary (welcome).
-5. Loop (tokio::select!):
+5. Snapshot on connect: if snapshot_state is set, read it (with short retries if launches empty), then send ServerMessage::SnapshotMigrated, SnapshotSoonMigrating, SnapshotLaunches, SnapshotTrades in that order. Else if redis_client is set, read the four Redis keys and send the same four message types. See [messages.md](messages.md) for connection order.
+6. Loop (tokio::select!):
    - **broadcast_rx.recv():** On Ok(msg), send Message::Binary(msg) to client; on Lagged(n), if max_lag_drop is set and n >= limit, break (disconnect); else log and continue. On Closed, break.
    - **ws_receiver.next():** On Ping, send Pong. On Close or None or Err, break. Other frames (e.g. text) ignored.
-6. Decrement client_count, log “Client X disconnected (Y remaining)”, return Ok.
+7. Decrement client_count, log “Client X disconnected (Y remaining)”, return Ok.
 
-So each client gets: one Connected, then every broadcast message in order. If the client can’t keep up, it may be disconnected when Lagged(n) >= max_lag_drop. ConnectionGuard is held for the duration so the semaphore permit is released when the task exits.
+So each client gets: one Connected, then the four snapshots (when snapshot_state or redis_client is set), then every broadcast message in order. If the client can’t keep up, it may be disconnected when Lagged(n) >= max_lag_drop. ConnectionGuard is held for the duration so the semaphore permit is released when the task exits.
 
 ---
 
 ## Dependencies
 
-- **crate::messages:** ConnectedPayload, ServerMessage (for welcome).
+- **crate::messages:** ConnectedPayload, ServerMessage (for welcome and snapshots).
+- **crate::storage:** SnapshotState (for snapshot_state field and on-connect read).
 - **bytes::Bytes** — zero-copy clone for broadcast.
-- **tokio** — TcpListener, TcpStream, spawn, sync (broadcast, Semaphore).
+- **tokio** — TcpListener, TcpStream, spawn, sync (broadcast, Semaphore, RwLock).
 - **tokio_tungstenite** — accept_async, Message (Binary, Ping, Pong, Close).
 - **socket2** — SO_REUSEADDR, bind, listen (for bind_reuse).
+- **redis** — AsyncCommands (when redis_client is set, for snapshot keys).
 
-No config struct; WsConfig reads env in Default.
+No config struct; WsConfig reads env in Default. WsServer::new(config, snapshot_state, redis_client) is called from main.

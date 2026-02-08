@@ -10,11 +10,13 @@ This document walks through the binary from startup to shutdown. No external ref
 
 1. Install TLS provider and init logging.
 2. Load and validate config (env); exit if invalid.
-3. Start WebSocket server (listener task) on `WS_PORT`.
-4. Build optional ClickHouse client; if present, ensure `pipeline_metrics` table.
-5. Set up shutdown (Ctrl+C) and gRPC retry backoff.
-6. Retry loop: connect gRPC, subscribe to transactions (Pump.fun + Pump AMM), run `handle_stream_updates` until stream ends or shutdown. On stream error, backoff and reconnect.
-7. Process exits when retry gives up or shutdown is requested.
+3. Build in-memory snapshot state (Arc<RwLock<SnapshotState>>); optional Redis client from REDIS_URL.
+4. Start WebSocket server (listener task) on `WS_PORT` with snapshot state and optional Redis client.
+5. Build optional ClickHouse client (unless SKIP_CLICKHOUSE); ensure pipeline_metrics and storage tables; if CLEAR_CLICKHOUSE or CLEAR_CLICKHOUSE_ONLY, drop and recreate tables; if CLEAR_CLICKHOUSE_ONLY, set metrics_client to None for the rest of the run.
+6. Spawn storage worker (channel receiver, ClickHouse client, redis_url, snapshot state).
+7. Set up shutdown (Ctrl+C) and gRPC retry backoff.
+8. Retry loop: connect gRPC, subscribe to transactions (Pump.fun + Pump AMM), run `handle_stream_updates` (with storage_tx) until stream ends or shutdown. On stream error, backoff and reconnect.
+9. Process exits when retry gives up or shutdown is requested.
 
 ---
 
@@ -30,23 +32,33 @@ This document walks through the binary from startup to shutdown. No external ref
 - `Config::default()` — reads env: `GRPC_ENDPOINT` (required), `GRPC_API_KEY`, `WS_*`, `CLICKHOUSE_*`, etc. See [config.md](config.md).
 - `config.validate()` — endpoint non-empty and starts with `http://` or `https://`. Returns `anyhow::Result`; main `?` so invalid config exits.
 
-### 3. WebSocket server
+### 3. Snapshot state and WebSocket server
 
+- `snapshot_state = Arc::new(RwLock::new(SnapshotState::default()))` — shared in-memory snapshot; storage worker updates it; ws_server reads it on each new client connect.
+- `redis_client`: from `config.redis_url` if set; passed to WsServer for optional Redis-backed snapshots.
 - `WS_PORT`: env or default 5566.
 - `WsConfig::default()` — from env: `WS_MAX_CONNECTIONS`, `WS_MAX_LAG_DROP`.
-- `WsServer::new(ws_config)` then `ws_server.start(ws_port).await` — binds `0.0.0.0:port`, spawns accept loop, returns a join handle. Main holds that handle so the process doesn’t exit; the loop runs until the process exits. See [ws_server.md](ws_server.md).
+- `WsServer::new(ws_config, Some(snapshot_state), redis_client)` then `ws_server.start(ws_port).await` — binds `0.0.0.0:port`, spawns accept loop, returns a join handle. See [ws_server.md](ws_server.md).
 
 ### 4. gRPC client and ClickHouse
 
 - `GrpcClient::new(config)` — wrapper around config; actual connect is in the retry loop. See [client.md](client.md).
-- If `config.clickhouse_url` is set: `db::make_client(url, user, password)`, then `db::ensure_table(client)` to create `pipeline_metrics` if not exists. `metrics_client` is `Option<Arc<clickhouse::Client>>`; cloned into the retry closure for the handler.
+- If `config.skip_clickhouse` is true: `metrics_client = None` (no ClickHouse; log "ClickHouse disabled").
+- Else if `config.clickhouse_url` is set: `db::make_client(url, user, password)`, then `db::ensure_table` and `ensure_token_launches_table`, `ensure_trades_table`, `ensure_migrations_table`. If `clear_clickhouse` or `clear_clickhouse_only`: `db::drop_tables` then ensure all four again. If `clear_clickhouse_only`: set `metrics_client = None` so no further writes this run.
+- `metrics_client` is cloned into the retry closure for the handler and into the storage worker.
 
-### 5. Backoff and shutdown
+### 5. Storage worker
+
+- `(storage_tx, storage_rx) = mpsc::channel(50_000)`.
+- `storage::spawn_storage_worker(storage_rx, metrics_client, config.redis_url, Some(snapshot_state))` — consumes channel; writes to ClickHouse (token_launches, trades, migrations) when client is Some; updates snapshot_state (migrated, soon_migrating, last 50 launches, their trades); optionally writes same to Redis when redis_url is set. See [storage.md](storage.md).
+- `storage_tx` is cloned into the retry closure and passed to `handle_stream_updates`.
+
+### 6. Backoff and shutdown
 
 - `ExponentialBackoff`: initial 500 ms, max 30 s, multiplier 1.5; optional max elapsed from config. Used by `future::retry` in the loop.
 - `watch::channel(false)` — shutdown signal. A task waits for Ctrl+C and sends `true`. The retry closure checks `shutdown_rx.borrow()` before connect and after; if true, returns permanent error and the loop exits.
 
-### 6. Retry loop (closure)
+### 7. Retry loop (closure)
 
 Each attempt:
 
@@ -56,11 +68,11 @@ Each attempt:
 4. `multi_parser::build_parser_map()` — map program id bytes → `"pump_fun"` / `"pump_amm"`. Keys are base58-decoded program IDs; subscription needs base58 strings, so keys are encoded to strings for the request.
 5. Build `SubscribeRequest`: only `transactions` filter; `account_include` = Pump.fun and Pump AMM program IDs (from parser_map keys); `vote: false`; commitment from config (Processed). No slots/accounts/entry/blocks.
 6. `grpc.subscribe_with_request(Some(subscribe_request)).await` — returns `(subscribe_tx, stream)`.
-7. `tokio::select!`: either `handle_stream_updates(stream, subscribe_tx, config, ws_server, parser_map, metrics_client)` completes (then map result to transient/permanent error for retry), or `shutdown_rx.changed()` (then return permanent error).
+7. `tokio::select!`: either `handle_stream_updates(stream, subscribe_tx, config, ws_server, parser_map, metrics_client, storage_tx)` completes (then map result to transient/permanent error for retry), or `shutdown_rx.changed()` (then return permanent error).
 
 So: one long-lived stream; when the stream errors or ends, `handle_stream_updates` returns, the error is treated as transient, and `future::retry` runs the closure again after backoff. Shutdown makes the error permanent so retry stops.
 
-### 7. Top-level select and exit
+### 8. Top-level select and exit
 
 - `tokio::select! { run => ..., ws_handle => ... }` — wait for either the retry future to finish or the WebSocket server handle (which never completes in normal operation). If run fails with non-shutdown error, it’s logged. Process then exits with `Ok(())`.
 
@@ -70,9 +82,10 @@ So: one long-lived stream; when the stream errors or ends, `handle_stream_update
 
 - **config** — Config, validation.
 - **client** — GrpcClient, connect.
-- **db** — make_client, ensure_table; handler uses update_metrics_aggregates_optional.
-- **handler** — handle_stream_updates(stream, subscribe_tx, config, ws_server, parser_map, metrics_client).
+- **db** — make_client, ensure_table, ensure_token_launches_table, ensure_trades_table, ensure_migrations_table, drop_tables; handler uses update_metrics_aggregates_optional; storage uses insert_*.
+- **handler** — handle_stream_updates(stream, subscribe_tx, config, ws_server, parser_map, metrics_client, storage_tx).
 - **multi_parser** — build_parser_map.
-- **ws_server** — WsServer, WsConfig, start.
+- **storage** — SnapshotState, spawn_storage_worker; handler sends StorageMessage on channel.
+- **ws_server** — WsServer, WsConfig, start; WsServer holds snapshot_state and optional redis_client.
 
 All other modules are used indirectly (handler uses messages, events, protocols via multi_parser, etc.).

@@ -161,3 +161,274 @@ pub async fn update_metrics_aggregates_optional(
         }
     }
 }
+
+// ----- Token launches, trades, migrations (storage worker writes; handler sends to channel) -----
+
+const TABLE_TOKEN_LAUNCHES: &str = "token_launches";
+const TABLE_TRADES: &str = "trades";
+const TABLE_MIGRATIONS: &str = "migrations";
+
+#[derive(Debug, Row, Serialize, Deserialize)]
+pub struct TokenLaunchRow {
+    pub signature: String,
+    pub slot: u64,
+    pub mint: String,
+    pub name: String,
+    pub symbol: String,
+    pub uri: String,
+    pub creator: String,
+    pub received_at: u64,
+    pub sent_at: u64,
+}
+
+#[derive(Debug, Row, Serialize, Deserialize)]
+pub struct TradeRow {
+    pub signature: String,
+    pub slot: u64,
+    pub mint: String,
+    pub trader: String,
+    pub direction: String,
+    pub token_amount: u64,
+    pub sol_amount: u64,
+    pub virtual_token_reserves: u64,
+    pub is_create: u8,
+    pub pool: Option<String>,
+    pub received_at: u64,
+    pub sent_at: u64,
+}
+
+#[derive(Debug, Row, Serialize, Deserialize)]
+pub struct MigrationRow {
+    pub signature: String,
+    pub slot: u64,
+    pub mint: String,
+    pub user: String,
+    pub bonding_curve: String,
+    pub pool: String,
+    pub token_amount: u64,
+    pub sol_amount: u64,
+    pub fee: u64,
+    pub received_at: u64,
+    pub sent_at: u64,
+}
+
+pub async fn ensure_token_launches_table(client: &Client) -> clickhouse::error::Result<()> {
+    let ddl = format!(
+        r#"
+        CREATE TABLE IF NOT EXISTS {TABLE_TOKEN_LAUNCHES} (
+            signature String,
+            slot UInt64,
+            mint String,
+            name String,
+            symbol String,
+            uri String,
+            creator String,
+            received_at UInt64,
+            sent_at UInt64
+        )
+        ENGINE = MergeTree()
+        ORDER BY (mint, slot)
+        "#
+    );
+    client.query(ddl.as_str()).execute().await?;
+    info!("ClickHouse table {} ensured", TABLE_TOKEN_LAUNCHES);
+    Ok(())
+}
+
+pub async fn ensure_trades_table(client: &Client) -> clickhouse::error::Result<()> {
+    let ddl = format!(
+        r#"
+        CREATE TABLE IF NOT EXISTS {TABLE_TRADES} (
+            signature String,
+            slot UInt64,
+            mint String,
+            trader String,
+            direction String,
+            token_amount UInt64,
+            sol_amount UInt64,
+            virtual_token_reserves UInt64,
+            is_create UInt8,
+            pool Nullable(String),
+            received_at UInt64,
+            sent_at UInt64
+        )
+        ENGINE = MergeTree()
+        ORDER BY (mint, slot)
+        "#
+    );
+    client.query(ddl.as_str()).execute().await?;
+    info!("ClickHouse table {} ensured", TABLE_TRADES);
+    Ok(())
+}
+
+pub async fn ensure_migrations_table(client: &Client) -> clickhouse::error::Result<()> {
+    let ddl = format!(
+        r#"
+        CREATE TABLE IF NOT EXISTS {TABLE_MIGRATIONS} (
+            signature String,
+            slot UInt64,
+            mint String,
+            user String,
+            bonding_curve String,
+            pool String,
+            token_amount UInt64,
+            sol_amount UInt64,
+            fee UInt64,
+            received_at UInt64,
+            sent_at UInt64
+        )
+        ENGINE = MergeTree()
+        ORDER BY (mint, slot)
+        "#
+    );
+    client.query(ddl.as_str()).execute().await?;
+    info!("ClickHouse table {} ensured", TABLE_MIGRATIONS);
+    Ok(())
+}
+
+/// DROP then recreate all pipeline tables when CLEAR_CLICKHOUSE=1 so schema matches current code.
+pub async fn drop_tables(client: &Client) -> clickhouse::error::Result<()> {
+    for table in [TABLE, TABLE_TOKEN_LAUNCHES, TABLE_TRADES, TABLE_MIGRATIONS] {
+        client
+            .query(format!("DROP TABLE IF EXISTS {}", table).as_str())
+            .execute()
+            .await?;
+        info!("ClickHouse table {} dropped", table);
+    }
+    Ok(())
+}
+
+pub async fn insert_token_launch(client: &Client, row: &TokenLaunchRow) -> clickhouse::error::Result<()> {
+    let mut insert = client.insert::<TokenLaunchRow>(TABLE_TOKEN_LAUNCHES).await?;
+    insert.write(row).await?;
+    insert.end().await?;
+    Ok(())
+}
+
+pub async fn insert_trade(client: &Client, row: &TradeRow) -> clickhouse::error::Result<()> {
+    let mut insert = client.insert::<TradeRow>(TABLE_TRADES).await?;
+    insert.write(row).await?;
+    insert.end().await?;
+    Ok(())
+}
+
+pub async fn insert_migration(client: &Client, row: &MigrationRow) -> clickhouse::error::Result<()> {
+    let mut insert = client.insert::<MigrationRow>(TABLE_MIGRATIONS).await?;
+    insert.write(row).await?;
+    insert.end().await?;
+    Ok(())
+}
+
+// ----- Holder stats (trading-derived: balance = sum(buys) - sum(sells) per mint/trader) -----
+
+/// One row: trader address and their balance for a mint (from trades only; no transfers).
+#[allow(dead_code)] // public API, see docs/RUNBOOK.md
+#[derive(Debug, Row, Serialize, Deserialize)]
+pub struct HolderBalanceRow {
+    pub trader: String,
+    pub balance: i64,
+}
+
+/// Top 10 holders % and dev holding % for a mint. Query uses trades + token_launches (creator).
+/// Balances are trading-derived (buys - sells); dev % uses creator from token_launches.
+#[allow(dead_code)] // public API, see docs/RUNBOOK.md
+pub async fn query_holder_stats(
+    client: &Client,
+    mint: &str,
+) -> clickhouse::error::Result<(f64, f64, Vec<(String, u64)>)> {
+    // Balance per trader: sum(buy amount) - sum(sell amount). Signed to allow sells.
+    let top10_query = format!(
+        r#"
+        WITH balances AS (
+            SELECT
+                trader,
+                sum(if(direction = 'buy', toInt64(token_amount), -toInt64(token_amount))) AS bal
+            FROM {TABLE_TRADES}
+            WHERE mint = ?
+            GROUP BY trader
+            HAVING bal > 0
+        ),
+        total AS (SELECT sum(bal) AS t FROM balances),
+        ranked AS (
+            SELECT trader, bal, row_number() OVER (ORDER BY bal DESC) AS rn
+            FROM balances
+        )
+        SELECT trader, bal AS balance
+        FROM ranked
+        WHERE rn <= 10
+        ORDER BY rn
+        "#
+    );
+    let mut cursor = client
+        .query(top10_query.as_str())
+        .bind(mint)
+        .fetch::<HolderBalanceRow>()?;
+    let mut top10: Vec<(String, u64)> = Vec::new();
+    let mut sum_top10: u64 = 0;
+    while let Some(row) = cursor.next().await? {
+        let bal = row.balance.max(0) as u64;
+        sum_top10 += bal;
+        top10.push((row.trader, bal));
+    }
+
+    // Total supply (sum of all positive balances) for this mint
+    #[derive(Row, Serialize, Deserialize)]
+    struct TotalRow { tot: i64 }
+    let total_query = format!(
+        r#"
+        SELECT sum(if(direction = 'buy', toInt64(token_amount), -toInt64(token_amount))) AS tot
+        FROM {TABLE_TRADES}
+        WHERE mint = ?
+        "#
+    );
+    let mut total_cursor = client
+        .query(total_query.as_str())
+        .bind(mint)
+        .fetch::<TotalRow>()?;
+    let total: i64 = total_cursor.next().await?.map(|r| r.tot).unwrap_or(0);
+    let total_positive = total.max(0) as u64;
+    let top10_pct = if total_positive > 0 {
+        (sum_top10 as f64 / total_positive as f64) * 100.0
+    } else {
+        0.0
+    };
+
+    // Creator (dev) for this mint from token_launches
+    #[derive(Row, Serialize, Deserialize)]
+    struct CreatorRow { creator: String }
+    let creator_query = format!(
+        r#"SELECT creator FROM {TABLE_TOKEN_LAUNCHES} WHERE mint = ? LIMIT 1"#
+    );
+    let mut creator_cursor = client
+        .query(creator_query.as_str())
+        .bind(mint)
+        .fetch::<CreatorRow>()?;
+    let creator: Option<String> = creator_cursor.next().await?.map(|r| r.creator);
+    #[derive(Row, Serialize, Deserialize)]
+    struct BalRow { bal: i64 }
+    let dev_pct = if let Some(creator) = creator {
+        let dev_bal_query = format!(
+            r#"
+            SELECT sum(if(direction = 'buy', toInt64(token_amount), -toInt64(token_amount))) AS bal
+            FROM {TABLE_TRADES}
+            WHERE mint = ? AND trader = ?
+            "#
+        );
+        let mut dev_cursor = client
+            .query(dev_bal_query.as_str())
+            .bind(mint)
+            .bind(creator.as_str())
+            .fetch::<BalRow>()?;
+        let dev_bal: i64 = dev_cursor.next().await?.map(|r| r.bal).unwrap_or(0);
+        let dev_bal_u = dev_bal.max(0) as u64;
+        if total_positive > 0 {
+            (dev_bal_u as f64 / total_positive as f64) * 100.0
+        } else {
+            0.0
+        }
+    } else {
+        0.0
+    };
+
+    Ok((top10_pct, dev_pct, top10))
+}

@@ -31,6 +31,14 @@ pub enum ServerMessage {
     TokenLaunch(TokenLaunchPayload),
     Trade(crate::events::Trade),
     Migration(crate::events::Migration),
+    /// Snapshot of migrated tokens (mint, pool, ...). Sent once on connect (in-memory; no Redis required).
+    SnapshotMigrated(Vec<crate::storage::MigratedEntry>),
+    /// Snapshot of tokens soon migrating (progress %). Sent once on connect.
+    SnapshotSoonMigrating(Vec<crate::storage::SoonMigratingEntry>),
+    /// Last 50 token launches. Sent once on connect.
+    SnapshotLaunches(Vec<TokenLaunchPayload>),
+    /// Trades for the mints in the last 50 launches. Sent once on connect.
+    SnapshotTrades(Vec<crate::events::Trade>),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

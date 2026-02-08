@@ -4,6 +4,22 @@ How to confirm the pipeline is healthy and what to do when something goes wrong.
 
 ---
 
+## How to run (quick reference)
+
+Full run options and env table: [README.md](README.md#how-to-run).
+
+| Goal | Command |
+|------|--------|
+| Minimal (WS only) | `GRPC_ENDPOINT=https://... cargo run --release` |
+| Save to ClickHouse | `GRPC_ENDPOINT=... CLICKHOUSE_URL=http://localhost:8123 cargo run --release` |
+| Dev: clear DB each run | Add `CLEAR_CLICKHOUSE=1` (requires CLICKHOUSE_URL). |
+| Dev: clear once, no save | Add `CLEAR_CLICKHOUSE_ONLY=1` (requires CLICKHOUSE_URL). |
+| No ClickHouse | Add `SKIP_CLICKHOUSE=1`. |
+
+Run from the `data-pipeline` directory. WebSocket default port: 5566 (`WS_PORT`).
+
+---
+
 ## Confirming gRPC is connected
 
 - **Logs:** On successful connect you should see: `Connected to blockchain gRPC`. If the stream later errors, you’ll see `Connection failed, retrying: ...` and then a new `Connected to blockchain gRPC` after backoff.
@@ -21,10 +37,11 @@ How to confirm the pipeline is healthy and what to do when something goes wrong.
 
 ## ClickHouse (optional)
 
-- **When used:** Only when `CLICKHOUSE_URL` is set. main builds the client and calls `db::ensure_table` (creates `pipeline_metrics` if not exists). Handler calls `update_metrics_aggregates_optional` for each launch; if ClickHouse is unset, it’s a no-op.
-- **Table:** `pipeline_metrics` (key, value, updated_at). Keys: launch_count, grpc_sum_ms, grpc_min_ms, grpc_max_ms, server_sum_us, server_min_us, server_max_us. See [db.md](db.md).
-- **If writes fail:** We log `ClickHouse metrics update failed: ...`. No retry or circuit breaker in the current code; stream and WebSocket are unaffected.
-- **Confirming writes:** Query the DB (e.g. `SELECT key, argMax(value, updated_at) FROM pipeline_metrics GROUP BY key`). There is no in-process health endpoint.
+- **When used:** When `CLICKHOUSE_URL` is set and `SKIP_CLICKHOUSE` is not set. main ensures pipeline_metrics and storage tables (token_launches, trades, migrations). Handler writes metrics; storage worker writes launches/trades/migrations.
+- **Env flags:** `CLEAR_CLICKHOUSE=1` — drop and recreate all four tables on startup. `SKIP_CLICKHOUSE=1` — no ClickHouse client. `CLEAR_CLICKHOUSE_ONLY=1` — drop and recreate then do not write for the rest of the run.
+- **Tables:** `pipeline_metrics` (key, value, updated_at); `token_launches`, `trades`, `migrations`. See [db.md](db.md).
+- **If writes fail:** We log `ClickHouse metrics update failed` or `insert_* failed`. No retry; stream and WebSocket are unaffected.
+- **Confirming writes:** Query the DB (e.g. `SELECT key, argMax(value, updated_at) FROM pipeline_metrics GROUP BY key` or `SELECT count() FROM token_launches`). No in-process health endpoint.
 
 ---
 
@@ -54,3 +71,23 @@ How to confirm the pipeline is healthy and what to do when something goes wrong.
 | Data flowing? | Logs: LAUNCH / BUY/SELL / MIGRATE lines; or connect a WS client and see messages. |
 | ClickHouse OK? | Query pipeline_metrics; or check logs for "ClickHouse metrics update failed". |
 | Why no launches? | Verify endpoint, filter (program IDs), commitment; check "Transaction error" in logs. |
+
+---
+
+## Holder stats (top 10 % and dev %) from the DB
+
+Balances are **trading-derived** only (buys − sells per mint/trader); we do not see SPL transfers. Dev is the **creator** from `token_launches`.
+
+Use `db::query_holder_stats(client, mint)` (in Rust). It returns:
+
+- `top10_pct`: share of supply held by the top 10 holders (0–100).
+- `dev_pct`: share of supply held by the creator (0–100).
+- `top10`: list of `(trader, balance)` for the top 10.
+
+Example (e.g. from an API or script that has a ClickHouse client):
+
+```rust
+let (top10_pct, dev_pct, top10) = db::query_holder_stats(&client, "MintBase58Here").await?;
+```
+
+Equivalent logic in SQL: aggregate `trades` by `mint` and `trader` with `sum(if(direction='buy', token_amount, -token_amount))`, take positive balances only; join `token_launches` for `creator`; then top 10 and creator balance as % of total.

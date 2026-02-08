@@ -3,12 +3,14 @@ use crate::db;
 use crate::events::TradeDirection;
 use crate::messages::{ServerMessage, TokenLaunchPayload};
 use crate::multi_parser;
+use crate::storage::StorageMessage;
 use crate::ws_server::WsServer;
 use futures::{sink::SinkExt, stream::StreamExt};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use tracing::{error, info, warn};
+use tokio::sync::mpsc;
+use tracing::{debug, error, warn};
 use yellowstone_grpc_proto::prelude::{
     subscribe_update::UpdateOneof, SubscribeRequest, SubscribeRequestPing,
 };
@@ -22,6 +24,7 @@ pub async fn handle_stream_updates(
     ws_server: Arc<WsServer>,
     parser_map: Arc<HashMap<Vec<u8>, &'static str>>,
     metrics_client: Option<Arc<clickhouse::Client>>,
+    storage_tx: mpsc::Sender<StorageMessage>,
 ) -> anyhow::Result<()> {
     let mut last_ping = std::time::Instant::now();
     let ping_interval = std::time::Duration::from_secs(30);
@@ -42,6 +45,7 @@ pub async fn handle_stream_updates(
                             &*migration_count,
                             ws_server.as_ref(),
                             metrics_client.as_ref().map(Arc::as_ref),
+                            &storage_tx,
                         )
                         .await
                         {
@@ -75,6 +79,7 @@ async fn handle_transaction(
     migration_count: &AtomicU64,
     ws_server: &WsServer,
     metrics_client: Option<&clickhouse::Client>,
+    storage_tx: &mpsc::Sender<StorageMessage>,
 ) -> anyhow::Result<()> {
     let instructions = InstructionUpdate::parse_from_txn(tx_update)
         .map_err(|e| anyhow::anyhow!("parse_from_txn: {:?}", e))?;
@@ -85,6 +90,18 @@ async fn handle_transaction(
     multi_parser::enrich_token_launches(&instructions, parser_map, &mut launches, &trades);
 
     for mut launch in launches {
+        let has_display_data = !launch.mint.is_empty()
+            && (!launch.name.is_empty() || !launch.symbol.is_empty() || !launch.uri.is_empty());
+        if !has_display_data {
+            debug!(
+                "Skipping launch with no display data: mint={} name={:?} symbol={:?}",
+                &launch.mint,
+                launch.name.is_empty(),
+                launch.symbol.is_empty()
+            );
+            continue;
+        }
+
         let count = launch_count.fetch_add(1, Ordering::Relaxed) + 1;
         let log_msg = format!(
             "#{} LAUNCH | {} ({}) | mint={}",
@@ -99,6 +116,10 @@ async fn handle_transaction(
         let grpc_ms = (received_at as f64 / 1000.0) - (launch.txn_timestamp as f64);
         let server_us = (launch.sent_at - received_at) as f64;
         db::update_metrics_aggregates_optional(metrics_client, grpc_ms, server_us).await;
+
+        if storage_tx.try_send(StorageMessage::TokenLaunch(launch.clone())).is_err() {
+            tracing::warn!("Storage channel full, dropping TokenLaunch");
+        }
 
         let payload = TokenLaunchPayload {
             signature: launch.signature,
@@ -116,7 +137,7 @@ async fn handle_transaction(
         if let Ok(bytes) = rmp_serde::to_vec(&ServerMessage::TokenLaunch(payload)) {
             ws_server.broadcast(bytes);
         }
-        info!("{} | clients={}", log_msg, ws_server.client_count());
+        debug!("{} | clients={}", log_msg, ws_server.client_count());
     }
 
     for mut trade in trades {
@@ -137,10 +158,13 @@ async fn handle_transaction(
             create_marker
         );
         trade.sent_at = unix_timestamp_micros();
-        if let Ok(bytes) = rmp_serde::to_vec(&ServerMessage::Trade(trade)) {
+        if let Ok(bytes) = rmp_serde::to_vec(&ServerMessage::Trade(trade.clone())) {
             ws_server.broadcast(bytes);
         }
-        info!("{} | clients={}", log_msg, ws_server.client_count());
+        if storage_tx.try_send(StorageMessage::Trade(trade)).is_err() {
+            tracing::warn!("Storage channel full, dropping Trade");
+        }
+        debug!("{} | clients={}", log_msg, ws_server.client_count());
     }
 
     let migrations = multi_parser::parse_migration_events(&instructions, parser_map, received_at);
@@ -153,10 +177,13 @@ async fn handle_transaction(
             &migration.pool[..migration.pool.len().min(8)]
         );
         migration.sent_at = unix_timestamp_micros();
-        if let Ok(bytes) = rmp_serde::to_vec(&ServerMessage::Migration(migration)) {
+        if let Ok(bytes) = rmp_serde::to_vec(&ServerMessage::Migration(migration.clone())) {
             ws_server.broadcast(bytes);
         }
-        info!("{} | clients={}", log_msg, ws_server.client_count());
+        if storage_tx.try_send(StorageMessage::Migration(migration)).is_err() {
+            tracing::warn!("Storage channel full, dropping Migration");
+        }
+        debug!("{} | clients={}", log_msg, ws_server.client_count());
     }
 
     Ok(())
