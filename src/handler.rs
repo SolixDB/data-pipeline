@@ -119,7 +119,6 @@ async fn handle_transaction(
         );
         launch.sent_at = unix_timestamp_micros();
 
-        // Metrics: grpc latency (received_at in us -> ms, txn_timestamp in ms)
         let grpc_ms = (received_at as f64 / 1000.0) - (launch.txn_timestamp as f64);
         let server_us = (launch.sent_at - received_at) as f64;
         db::update_metrics_aggregates_optional(metrics_client, grpc_ms, server_us).await;

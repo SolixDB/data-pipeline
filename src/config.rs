@@ -13,7 +13,7 @@ pub struct Config {
     pub clickhouse_url: Option<String>,
     pub clickhouse_user: Option<String>,
     pub clickhouse_password: Option<String>,
-    #[allow(dead_code)] // read from main.rs (redis client, storage worker)
+    #[allow(dead_code)]
     pub redis_url: Option<String>,
     /// When true, TRUNCATE pipeline ClickHouse tables on startup (for dev).
     pub clear_clickhouse: bool,

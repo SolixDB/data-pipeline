@@ -1,8 +1,3 @@
-//! Event types for the data stream.
-//!
-//! These are the canonical events emitted and sent to clients.
-//! Format matches grpc-data-stream.
-
 use serde::{Deserialize, Serialize};
 
 /// Bonding curve reserve state (virtual and real). Affects price and slippage for buy/sell.
@@ -55,10 +50,6 @@ impl Default for PumpProtocolConstants {
     }
 }
 
-/// Pump.fun PDAs and accounts needed for transaction building (bonding curve phase).
-/// All addresses are base58 strings. Use these so frontend/backend can build Buy/Sell/Create
-/// without extra RPC for account resolution. For creator_vault and fee_config derivation
-/// See docs/pumpfun_accounts.md for PDA seeds and program IDs.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct PumpFunBondingCurveAccounts {
     /// Bonding curve PDA: seeds ["bonding-curve", mint], program = Pump.fun
@@ -116,8 +107,6 @@ pub enum TradeDirection {
     Sell,
 }
 
-/// Trade event decoded from pump.fun `tradeEvent` (logs).
-/// Includes curve state and fee so frontend can build follow-up tx and show slippage.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Trade {
     pub signature: String,
@@ -154,8 +143,6 @@ fn default_compute_unit_limit() -> u32 {
     300_000
 }
 
-/// Token migrated from pump.fun bonding curve to Raydium AMM (pump_amm).
-/// Frontend can use `mint` + `pool` to track the new pool and land trades there.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Migration {
     pub signature: String,

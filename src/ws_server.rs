@@ -17,10 +17,7 @@ const BROADCAST_CAPACITY: usize = 4096;
 /// Configuration for the WebSocket server (trading terminal central server).
 #[derive(Clone, Debug)]
 pub struct WsConfig {
-    /// Max concurrent connections; None = unlimited.
     pub max_connections: Option<usize>,
-    /// If a client drops this many messages in one lag event, disconnect them so they reconnect for fresh state.
-    /// None = never disconnect on lag (only log).
     pub max_lag_drop: Option<u64>,
 }
 
@@ -64,9 +61,7 @@ pub struct WsServer {
     client_count: AtomicU64,
     semaphore: Option<Arc<Semaphore>>,
     max_lag_drop: Option<u64>,
-    /// When set, on connect we send the four snapshots from this state (no Redis required).
     snapshot_state: Option<Arc<RwLock<SnapshotState>>>,
-    /// When set and snapshot_state is None, on connect we send snapshots from Redis.
     redis_client: Option<Arc<redis::Client>>,
 }
 
