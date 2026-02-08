@@ -298,23 +298,38 @@ pub async fn drop_tables(client: &Client) -> clickhouse::error::Result<()> {
     Ok(())
 }
 
-pub async fn insert_token_launch(client: &Client, row: &TokenLaunchRow) -> clickhouse::error::Result<()> {
+pub async fn insert_token_launches_batch(client: &Client, rows: &[TokenLaunchRow]) -> clickhouse::error::Result<()> {
+    if rows.is_empty() {
+        return Ok(());
+    }
     let mut insert = client.insert::<TokenLaunchRow>(TABLE_TOKEN_LAUNCHES).await?;
-    insert.write(row).await?;
+    for row in rows {
+        insert.write(row).await?;
+    }
     insert.end().await?;
     Ok(())
 }
 
-pub async fn insert_trade(client: &Client, row: &TradeRow) -> clickhouse::error::Result<()> {
+pub async fn insert_trades_batch(client: &Client, rows: &[TradeRow]) -> clickhouse::error::Result<()> {
+    if rows.is_empty() {
+        return Ok(());
+    }
     let mut insert = client.insert::<TradeRow>(TABLE_TRADES).await?;
-    insert.write(row).await?;
+    for row in rows {
+        insert.write(row).await?;
+    }
     insert.end().await?;
     Ok(())
 }
 
-pub async fn insert_migration(client: &Client, row: &MigrationRow) -> clickhouse::error::Result<()> {
+pub async fn insert_migrations_batch(client: &Client, rows: &[MigrationRow]) -> clickhouse::error::Result<()> {
+    if rows.is_empty() {
+        return Ok(());
+    }
     let mut insert = client.insert::<MigrationRow>(TABLE_MIGRATIONS).await?;
-    insert.write(row).await?;
+    for row in rows {
+        insert.write(row).await?;
+    }
     insert.end().await?;
     Ok(())
 }
