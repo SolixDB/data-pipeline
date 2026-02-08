@@ -12,7 +12,7 @@ ClickHouse client factory, `pipeline_metrics` table (aggregate metrics), and sto
 - **ensure_table(client)** — create `pipeline_metrics` if not exists (ReplacingMergeTree(updated_at)).
 - **ensure_token_launches_table(client)**, **ensure_trades_table(client)**, **ensure_migrations_table(client)** — create storage tables if not exists (MergeTree, ORDER BY (mint, slot)).
 - **drop_tables(client)** — DROP TABLE IF EXISTS for pipeline_metrics, token_launches, trades, migrations. Used when CLEAR_CLICKHOUSE or CLEAR_CLICKHOUSE_ONLY.
-- **insert_token_launch(client, row)**, **insert_trade(client, row)**, **insert_migration(client, row)** — single-row inserts; used by storage worker.
+- **insert_token_launches_batch(client, rows)**, **insert_trades_batch(client, rows)**, **insert_migrations_batch(client, rows)** — bulk inserts; used by storage worker (buffers then flushes on size or interval).
 - **update_metrics_aggregates_optional(client, grpc_ms, server_us)** — if client is Some, read current metrics, update aggregates, insert new rows. Logs on error but does not return it (no-op or log). Used by handler.
 - **query_holder_stats(client, mint)** — returns (top10_pct, dev_pct, top10). Public API for holder stats; see [RUNBOOK.md](RUNBOOK.md).
 
@@ -103,6 +103,6 @@ If `client` is None: do nothing. If Some: call `update_metrics_aggregates`; on e
 
 - **main:** make_client, ensure_table, ensure_token_launches_table, ensure_trades_table, ensure_migrations_table, drop_tables when ClickHouse is used; passes metrics_client into handle_stream_updates and storage worker.
 - **handler:** update_metrics_aggregates_optional for each launch (grpc_ms and server_us from that launch).
-- **storage:** insert_token_launch, insert_trade, insert_migration when ClickHouse client is set.
+- **storage:** insert_token_launches_batch, insert_trades_batch, insert_migrations_batch when ClickHouse client is set (buffers then flushes on size or interval).
 
 No health checks or other endpoints; if ClickHouse is down, the insert fails and we log.

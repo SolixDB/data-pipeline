@@ -16,9 +16,10 @@ Arguments:
 - `ws_server`: broadcast target.
 - `parser_map`: program id → `"pump_fun"` / `"pump_amm"` for multi_parser.
 - `metrics_client`: `Option<Arc<clickhouse::Client>>`; if None, metrics writes are no-op.
-- `storage_tx`: `mpsc::Sender<StorageMessage>`; handler sends TokenLaunch, Trade, Migration for each event (non-blocking try_send). Consumed by storage worker. See [storage.md](storage.md).
+- `storage_tx`: `mpsc::Sender<StorageMessage>`; handler sends TokenLaunch, Trade, Migration for each event with **backpressure** (`send().await`; blocks when channel full so the gRPC stream slows instead of dropping). Consumed by storage worker. See [storage.md](storage.md).
+- `health_state`: `Option<Arc<HealthState>>`; if Some, `record_activity()` is called at the start of each `handle_transaction` so the health endpoint reflects recent gRPC activity.
 
-Runs until the stream ends or errors. Returns `anyhow::Result<()>`; stream errors are returned as Err, so main can retry.
+Runs until the stream ends or errors. Returns `anyhow::Result<()>`; stream errors or storage channel closed are returned as Err, so main can retry.
 
 ---
 
@@ -43,15 +44,16 @@ Runs until the stream ends or errors. Returns `anyhow::Result<()>`; stream error
    - `launches = multi_parser::parse_token_launches(instructions, parser_map, received_at)` — Pump.fun Create only.
    - `trades = multi_parser::parse_trade_events(...)` — Pump.fun and Pump AMM Buy/Sell.
    - `multi_parser::enrich_token_launches(instructions, parser_map, &mut launches, &trades)` — fill fee_recipient and initial_bonding_curve_state where possible.
+0. **Health:** If `health_state` is Some, call `health_state.record_activity()` at the start of handle_transaction (so GET /health reflects recent gRPC activity).
 4. **Launches:** For each launch:
    - Compute metrics: `grpc_ms = (received_at/1000) - txn_timestamp` (ms), `server_us = sent_at - received_at` (μs). Then `db::update_metrics_aggregates_optional(metrics_client, grpc_ms, server_us)` (no-op if metrics_client is None).
    - Set `launch.sent_at = unix_timestamp_micros()`.
-   - `storage_tx.try_send(StorageMessage::TokenLaunch(launch.clone()))` (non-blocking).
+   - `storage_tx.send(StorageMessage::TokenLaunch(launch.clone())).await` (backpressure; returns Err if channel closed).
    - Build `TokenLaunchPayload` from launch (same-named fields; see [messages.md](messages.md)).
    - `rmp_serde::to_vec(&ServerMessage::TokenLaunch(payload))` and `ws_server.broadcast(bytes)`.
    - Log at debug level: `#N LAUNCH | name (symbol) | mint=... | clients=...`.
-5. **Trades:** For each trade: set `sent_at`, `storage_tx.try_send(StorageMessage::Trade(trade))`, serialize `ServerMessage::Trade(trade)`, broadcast, log at debug.
-6. **Migrations:** `migrations = multi_parser::parse_migration_events(...)`; for each: set `sent_at`, `storage_tx.try_send(StorageMessage::Migration(migration))`, serialize and broadcast, log at debug.
+5. **Trades:** For each trade: set `sent_at`, `storage_tx.send(StorageMessage::Trade(trade)).await`, serialize `ServerMessage::Trade(trade)`, broadcast, log at debug.
+6. **Migrations:** `migrations = multi_parser::parse_migration_events(...)`; for each: set `sent_at`, `storage_tx.send(StorageMessage::Migration(migration)).await`, serialize and broadcast, log at debug.
 
 Order: all launches first, then all trades, then all migrations. Counters (launch_count, trade_count, migration_count) are atomic and only used for log text.
 
