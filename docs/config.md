@@ -26,7 +26,7 @@ Config is loaded from the environment and validated at startup. This doc lists e
 | `clear_clickhouse_only` | `bool` | `CLEAR_CLICKHOUSE_ONLY` | When true (1/true/yes), connect to ClickHouse, drop and recreate tables, then set client to None for the rest of the run (no further writes). Requires CLICKHOUSE_URL. |
 | `health_port` | `u16` | `HEALTH_PORT` | HTTP health server port; 0 = disabled. Default 5567. |
 | `health_grpc_max_age_secs` | `u64` | `HEALTH_GRPC_MAX_AGE_SECS` | Health returns 200 only if last gRPC activity is within this many seconds. Default 120. |
-| `snapshot_launch_limit` | `usize` | `WS_INITIAL_SNAPSHOT_LAUNCH_LIMIT` | Max token launches in WS connect snapshot. Default 50. |
+| `snapshot_launch_limit` | `usize` | `WS_INITIAL_SNAPSHOT_LAUNCH_LIMIT` | Max token launches in WS connect snapshot. Default 30. |
 | `snapshot_trade_limit` | `usize` | `WS_INITIAL_SNAPSHOT_TRADE_LIMIT` | Max trades (for those mints) in WS connect snapshot. Default 1000. |
 
 ---

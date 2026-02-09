@@ -75,7 +75,7 @@ impl Default for Config {
             snapshot_launch_limit: env::var("WS_INITIAL_SNAPSHOT_LAUNCH_LIMIT")
                 .ok()
                 .and_then(|s| s.parse().ok())
-                .unwrap_or(50),
+                .unwrap_or(30),
             snapshot_trade_limit: env::var("WS_INITIAL_SNAPSHOT_TRADE_LIMIT")
                 .ok()
                 .and_then(|s| s.parse().ok())

@@ -218,12 +218,20 @@ async fn handle_transaction(
             token_state.market_cap = trade.market_cap;
             token_state.liquidity_sol = trade.liquidity_sol;
             token_state.last_slot = trade.slot;
+            
+            // Add trade to time-windowed volume tracking
             // sol_amount is in lamports, convert to SOL
-            token_state.volume_sol += trade.sol_amount as f64 / 1_000_000_000.0;
-            token_state.tx_count += 1;
-
-            trade.volume_sol = token_state.volume_sol;
-            trade.tx_count = token_state.tx_count;
+            let sol_amount = trade.sol_amount as f64 / 1_000_000_000.0;
+            token_state.add_trade(received_at, sol_amount);
+            
+            // Accumulate fees (all-time, from both pump.fun and pump_amm)
+            // fee is in lamports, convert to SOL
+            let fee_sol = trade.fee as f64 / 1_000_000_000.0;
+            token_state.total_fees_sol += fee_sol;
+            
+            // Populate trade with current volume metrics (24h volume for backward compatibility)
+            trade.volume_sol = token_state.volume_metrics.volume_24h;
+            trade.tx_count = token_state.volume_metrics.tx_count_24h;
         }
         let count = trade_count.fetch_add(1, Ordering::Relaxed) + 1;
         let dir = match trade.direction {

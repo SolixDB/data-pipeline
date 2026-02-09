@@ -19,8 +19,8 @@ Handler sends these on the channel via `storage_tx.send(...).await` (backpressur
 ## Snapshot types (wire and Redis)
 
 - **MigratedEntry:** mint, pool, signature, slot. Pushed when a Migration is processed.
-- **SoonMigratingEntry:** mint, progress_pct (f64), virtual_token_reserves (u64). Derived from curve reserves; progress ≥ 80% is “soon migrating”.
-- **TokenState:** mint, price, market_cap, liquidity_sol, volume_sol, tx_count, last_slot. Tracked for every active token.
+- **SoonMigratingEntry:** mint, progress_pct (f64), virtual_token_reserves (u64). Derived from curve reserves; progress ≥ 75% is “soon migrating”.
+- **TokenState:** mint, price, market_cap, liquidity_sol, volume_metrics (volume_5m/1h/6h/24h, tx_count_5m/1h/6h/24h), total_fees_sol (cumulative creator fees from all trades), trade_history (circular buffer), last_slot. Time-windowed volumes calculated from circular buffer with automatic cleanup every 60s.
 - **SnapshotState:** in-memory struct with migrated (Vec<MigratedEntry>), soon_migrating (Vec<SoonMigratingEntry>), launches (Vec<TokenLaunchPayload>), trades (Vec<Trade>), tickers (HashMap<String, TokenState>). Updated each loop; ws_server reads it on each new client connect.
 
 Redis keys (when redis_url is set): `snapshot:migrated`, `snapshot:soon_migrating`, `snapshot:launches`, `snapshot:trades`. JSON-serialized. Used by ws_server when snapshot_state is not the primary source (e.g. multi-instance) or as fallback.
@@ -33,7 +33,7 @@ Redis keys (when redis_url is set): `snapshot:migrated`, `snapshot:soon_migratin
 - **clickhouse:** Option<Arc<Client>>. When Some, rows are pushed into in-memory buffers; buffers are flushed with **batch inserts** when any buffer reaches 100 rows or 50 ms have passed since last flush (insert_token_launches_batch, insert_trades_batch, insert_migrations_batch). When None (e.g. SKIP_CLICKHOUSE or CLEAR_CLICKHOUSE_ONLY), no DB writes.
 - **redis_url:** Option<String>. When Some, after processing each message we write the four snapshot keys to Redis (JSON). Optional; in-memory snapshot_state is always updated when provided.
 - **snapshot_state:** Option<Arc<RwLock<SnapshotState>>>. When Some, each loop we write the current migrated_list, soon_migrating, last_launches (as Vec), recent_trades (as Vec) into the RwLock. main passes the same Arc to WsServer so new clients get this state.
-- **snapshot_launch_limit**, **snapshot_trade_limit:** Bounds for last_launches and recent_trades (from config; defaults 50 and 1000). Clamped to 1–10_000 and 1–50_000.
+- **snapshot_launch_limit**, **snapshot_trade_limit:** Bounds for last_launches and recent_trades (from config; defaults 30 and 1000). Clamped to 1–10_000 and 1–50_000.
 
 Runs in a tokio::spawn until rx is closed; then logs “Storage worker channel closed, exiting”.
 
