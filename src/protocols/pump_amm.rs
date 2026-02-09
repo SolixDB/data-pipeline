@@ -90,6 +90,8 @@ fn decode_buy_event(
         txn_timestamp,
         received_at,
         sent_at: 0,
+        volume_sol: 0.0,
+        tx_count: 0,
     })
 }
 
@@ -151,6 +153,8 @@ fn decode_sell_event(
         txn_timestamp,
         received_at,
         sent_at: 0,
+        volume_sol: 0.0,
+        tx_count: 0,
     })
 }
 

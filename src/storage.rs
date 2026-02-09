@@ -46,6 +46,31 @@ pub struct SoonMigratingEntry {
     pub virtual_token_reserves: u64,
 }
 
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct TokenState {
+    pub mint: String,
+    pub price: f64,
+    pub market_cap: f64,
+    pub liquidity_sol: f64,
+    pub volume_sol: f64,
+    pub tx_count: u64,
+    pub last_slot: u64,
+}
+
+impl TokenState {
+    pub fn new(mint: String) -> Self {
+        Self {
+            mint,
+            price: 0.0,
+            market_cap: 0.0,
+            liquidity_sol: 0.0,
+            volume_sol: 0.0,
+            tx_count: 0,
+            last_slot: 0,
+        }
+    }
+}
+
 pub const REDIS_KEY_MIGRATED: &str = "snapshot:migrated";
 pub const REDIS_KEY_SOON_MIGRATING: &str = "snapshot:soon_migrating";
 pub const REDIS_KEY_LAUNCHES: &str = "snapshot:launches";
@@ -57,6 +82,7 @@ pub struct SnapshotState {
     pub soon_migrating: Vec<SoonMigratingEntry>,
     pub launches: Vec<TokenLaunchPayload>,
     pub trades: Vec<Trade>,
+    pub tickers: HashMap<String, TokenState>,
 }
 
 /// Internal helpers

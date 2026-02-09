@@ -227,6 +227,12 @@ async fn handle_connection(
         if let Ok(bytes) = rmp_serde::to_vec_named(&ServerMessage::SnapshotTrades(snap.trades)) {
             let _ = ws_sender.send(Message::Binary(bytes.into())).await;
         }
+        let tickers: Vec<_> = snap.tickers.values().cloned().collect();
+        if !tickers.is_empty() {
+            if let Ok(bytes) = rmp_serde::to_vec_named(&ServerMessage::SnapshotTickers(tickers)) {
+                let _ = ws_sender.send(Message::Binary(bytes.into())).await;
+            }
+        }
     } else if let Some(ref redis) = server.redis_client {
         if let Ok(mut conn) = redis.get_multiplexed_async_connection().await {
             let migrated: Result<String, _> = conn.get(crate::storage::REDIS_KEY_MIGRATED).await;

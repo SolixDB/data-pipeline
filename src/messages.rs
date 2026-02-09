@@ -39,6 +39,8 @@ pub enum ServerMessage {
     SnapshotLaunches(Vec<TokenLaunchPayload>),
     /// Trades for the mints in the last 50 launches. Sent once on connect.
     SnapshotTrades(Vec<crate::events::Trade>),
+    /// Current state of all active tokens (Volume, Price, etc.). Sent once on connect.
+    SnapshotTickers(Vec<crate::storage::TokenState>),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

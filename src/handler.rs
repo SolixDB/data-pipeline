@@ -4,13 +4,13 @@ use crate::events::TradeDirection;
 use crate::health::HealthState;
 use crate::messages::{ServerMessage, TokenLaunchPayload};
 use crate::multi_parser;
-use crate::storage::StorageMessage;
+use crate::storage::{StorageMessage, SnapshotState, TokenState};
 use crate::ws_server::WsServer;
 use futures::{sink::SinkExt, stream::StreamExt};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, RwLock}; // Added RwLock
 use tracing::{debug, error, warn};
 use yellowstone_grpc_proto::prelude::{
     subscribe_update::UpdateOneof, SubscribeRequest, SubscribeRequestPing,
@@ -27,6 +27,7 @@ pub async fn handle_stream_updates(
     metrics_client: Option<Arc<clickhouse::Client>>,
     storage_tx: mpsc::Sender<StorageMessage>,
     health_state: Option<Arc<HealthState>>,
+    snapshot_state: Option<Arc<RwLock<SnapshotState>>>,
 ) -> anyhow::Result<()> {
     let mut last_ping = std::time::Instant::now();
     let ping_interval = std::time::Duration::from_secs(30);
@@ -49,6 +50,7 @@ pub async fn handle_stream_updates(
                             metrics_client.as_ref().map(Arc::as_ref),
                             &storage_tx,
                             health_state.as_deref(),
+                            snapshot_state.as_ref().map(|s| s.as_ref()),
                         )
                         .await
                         {
@@ -84,6 +86,7 @@ async fn handle_transaction(
     metrics_client: Option<&clickhouse::Client>,
     storage_tx: &mpsc::Sender<StorageMessage>,
     health_state: Option<&HealthState>,
+    snapshot_state: Option<&RwLock<SnapshotState>>,
 ) -> anyhow::Result<()> {
     if let Some(h) = health_state {
         h.record_activity();
@@ -146,6 +149,23 @@ async fn handle_transaction(
     }
 
     for mut trade in trades {
+        // Update ticker state
+        if let Some(state_lock) = snapshot_state {
+            let mut w = state_lock.write().await;
+            let token_state = w.tickers.entry(trade.mint.clone())
+                .or_insert_with(|| TokenState::new(trade.mint.clone()));
+
+            token_state.price = trade.price;
+            token_state.market_cap = trade.market_cap;
+            token_state.liquidity_sol = trade.liquidity_sol;
+            token_state.last_slot = trade.slot;
+            // sol_amount is in lamports, convert to SOL
+            token_state.volume_sol += trade.sol_amount as f64 / 1_000_000_000.0;
+            token_state.tx_count += 1;
+
+            trade.volume_sol = token_state.volume_sol;
+            trade.tx_count = token_state.tx_count;
+        }
         let count = trade_count.fetch_add(1, Ordering::Relaxed) + 1;
         let dir = match trade.direction {
             TradeDirection::Buy => "BUY",

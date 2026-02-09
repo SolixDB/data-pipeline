@@ -234,6 +234,8 @@ fn decode_trade_event(
         txn_timestamp,
         received_at: receive_ts,
         sent_at: 0,
+        volume_sol: 0.0,
+        tx_count: 0,
     })
 }
 
