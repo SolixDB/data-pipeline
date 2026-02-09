@@ -20,7 +20,8 @@ Handler sends these on the channel via `storage_tx.send(...).await` (backpressur
 
 - **MigratedEntry:** mint, pool, signature, slot. Pushed when a Migration is processed.
 - **SoonMigratingEntry:** mint, progress_pct (f64), virtual_token_reserves (u64). Derived from curve reserves; progress ≥ 80% is “soon migrating”.
-- **SnapshotState:** in-memory struct with migrated (Vec<MigratedEntry>), soon_migrating (Vec<SoonMigratingEntry>), launches (Vec<TokenLaunchPayload>), trades (Vec<Trade>). Updated each loop; ws_server reads it on each new client connect.
+- **TokenState:** mint, price, market_cap, liquidity_sol, volume_sol, tx_count, last_slot. Tracked for every active token.
+- **SnapshotState:** in-memory struct with migrated (Vec<MigratedEntry>), soon_migrating (Vec<SoonMigratingEntry>), launches (Vec<TokenLaunchPayload>), trades (Vec<Trade>), tickers (HashMap<String, TokenState>). Updated each loop; ws_server reads it on each new client connect.
 
 Redis keys (when redis_url is set): `snapshot:migrated`, `snapshot:soon_migrating`, `snapshot:launches`, `snapshot:trades`. JSON-serialized. Used by ws_server when snapshot_state is not the primary source (e.g. multi-instance) or as fallback.
 

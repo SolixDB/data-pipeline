@@ -115,7 +115,10 @@ One buy or sell (bonding curve or AMM). From pump_fun tradeEvent or pump_amm buy
 | pool | Option<String> | Set for AMM trades (migrated); None for bonding curve. |
 | suggested_compute_unit_limit | u32 | 300_000 default. |
 | token_decimals | u8 | 6. |
+| token_decimals | u8 | 6. |
 | txn_timestamp, received_at, sent_at | u64 | Timestamps. |
+| volume_sol | f64 | Accumulated volume in SOL (backend calculated). |
+| tx_count | u64 | Accumulated transaction count (backend calculated). |
 
 ---
 

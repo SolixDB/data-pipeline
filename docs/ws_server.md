@@ -51,7 +51,7 @@ Returns client_count.load(Relaxed). Used for logs (“clients=N”).
 2. tokio_tungstenite::accept_async(stream) — WebSocket handshake.
 3. Split into sender/receiver. Allocate client_id (next_id.fetch_add(1)+1), subscribe() to broadcast (new receiver for this client), increment client_count, log “Client X connected (Y total)”.
 4. Send one ServerMessage::Connected(ConnectedPayload { client_id }) as MessagePack binary (welcome).
-5. Snapshot on connect: if snapshot_state is set, read it (with short retries if launches empty), then send ServerMessage::SnapshotMigrated, SnapshotSoonMigrating, SnapshotLaunches, SnapshotTrades in that order. Else if redis_client is set, read the four Redis keys and send the same four message types. See [messages.md](messages.md) for connection order.
+5. Snapshot on connect: if snapshot_state is set, read it (with short retries if launches empty), then send ServerMessage::SnapshotMigrated, SnapshotSoonMigrating, SnapshotLaunches, SnapshotTrades, **SnapshotTickers** in that order. Else if redis_client is set, read the four Redis keys and send the same message types. See [messages.md](messages.md) for connection order.
 6. Loop (tokio::select!):
    - **broadcast_rx.recv():** On Ok(msg), send Message::Binary(msg) to client; on Lagged(n), if max_lag_drop is set and n >= limit, break (disconnect); else log and continue. On Closed, break.
    - **ws_receiver.next():** On Ping, send Pong. On Close or None or Err, break. Other frames (e.g. text) ignored.

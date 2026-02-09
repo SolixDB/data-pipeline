@@ -23,7 +23,9 @@ Types sent over the WebSocket: ServerMessage and its payloads. All frames are Me
 - **SnapshotMigrated(Vec<MigratedEntry>)** — sent once on connect. Full list of migrated tokens.
 - **SnapshotSoonMigrating(Vec<SoonMigratingEntry>)** — sent once on connect. Tokens nearing migration.
 - **SnapshotLaunches(Vec<TokenLaunchPayload>)** — sent once on connect. Last 50 token launches (same shape as TokenLaunch).
+- **SnapshotLaunches(Vec<TokenLaunchPayload>)** — sent once on connect. Last 50 token launches (same shape as TokenLaunch).
 - **SnapshotTrades(Vec<Trade>)** — sent once on connect. Trades for the mints in the last 50 launches (same shape as Trade).
+- **SnapshotTickers(Vec<TokenState>)** — sent once on connect. Current state (price, volume, etc.) for all active tokens.
 
 Snapshots are sent from in-memory state (no Redis required). Client must handle all variants. Snapshot variants use the same payload types as live messages.
 
@@ -61,7 +63,7 @@ Clients use this to display the new token and build Create/Buy/Sell without extr
 
 ## Trade (wire)
 
-Same struct as events::Trade. Fields: signature, slot, mint, trader, direction (buy/sell), token_amount, sol_amount, virtual_* and real_* reserves, price, market_cap, liquidity_sol, fee, is_create, pool (Some for AMM), suggested_compute_unit_limit, token_decimals, txn_timestamp, received_at, sent_at. See [events.md](events.md) for semantics.
+Same struct as events::Trade. Fields: signature, slot, mint, trader, direction (buy/sell), token_amount, sol_amount, virtual_* and real_* reserves, price, market_cap, liquidity_sol, fee, is_create, pool (Some for AMM), suggested_compute_unit_limit, token_decimals, txn_timestamp, received_at, sent_at, volume_sol, tx_count. See [events.md](events.md) for semantics.
 
 ---
 
@@ -79,6 +81,8 @@ Same struct as events::Migration. Fields: signature, slot, mint, user, bonding_c
 
 **SnapshotLaunches** and **SnapshotTrades** use the same payload types as live `TokenLaunch` and `Trade`; treat them the same in the UI (e.g. push into the same lists).
 
+**TokenState** (SnapshotTickers): `mint`, `price`, `market_cap`, `liquidity_sol`, `volume_sol`, `tx_count`, `last_slot`.
+
 ---
 
 ## Connection order (what a new client receives)
@@ -88,7 +92,8 @@ Same struct as events::Migration. Fields: signature, slot, mint, user, bonding_c
 3. **snapshot_soon_migrating** — Once. Replace or init soon-migrating list.
 4. **snapshot_launches** — Once. Last 50 launches; replace or init launch feed.
 5. **snapshot_trades** — Once. Trades for those mints; replace or init trade feed.
-6. **token_launch** / **trade** / **migration** — Live stream from then on. Append to the same lists.
+6. **snapshot_tickers** — Once. Current state of all active tokens.
+7. **token_launch** / **trade** / **migration** — Live stream from then on. Append to the same lists.
 
 Snapshots are always sent on connect from in-memory state. Redis is optional (used only when REDIS_URL is set, as an alternative snapshot source).
 
