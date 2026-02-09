@@ -52,7 +52,10 @@ Runs until the stream ends or errors. Returns `anyhow::Result<()>`; stream error
    - Build `TokenLaunchPayload` from launch (same-named fields; see [messages.md](messages.md)).
    - `rmp_serde::to_vec(&ServerMessage::TokenLaunch(payload))` and `ws_server.broadcast(bytes)`.
    - Log at debug level: `#N LAUNCH | name (symbol) | mint=... | clients=...`.
+   - **Cache:** Store `mint -> bonding_curve` in Redis (`bonding_curves` hash) for future enrichment. Add `mint` to `known_mints` (HashSet) to track active tokens.
 5. **Trades:** For each trade:
+   - **Filter:** Skip if mint not in `known_mints` (ignore trades for tokens we didn't see launch).
+   - **Enrich:** If `pool` is missing (Bonding Curve trade via CPI), fetch from Redis (`bonding_curves`).
    - Update `TokenState` in `SnapshotState`: `price`, `market_cap`, `liquidity_sol` from trade; add `sol_amount` to `volume_sol`; increment `tx_count`.
    - Set `trade.volume_sol` and `trade.tx_count` from updated state.
    - Set `sent_at`, `storage_tx.send(StorageMessage::Trade(trade)).await`, serialize `ServerMessage::Trade(trade)`, broadcast, log at debug.

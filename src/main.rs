@@ -60,6 +60,7 @@ async fn main() -> anyhow::Result<()> {
         .as_ref()
         .and_then(|url| redis::Client::open(url.as_str()).ok())
         .map(Arc::new);
+    let redis_client_for_handler = redis_client.clone();
     let ws_server = Arc::new(WsServer::new(ws_config, Some(snapshot_state.clone()), redis_client));
     let ws_handle = ws_server.start(ws_port).await;
 
@@ -106,6 +107,7 @@ async fn main() -> anyhow::Result<()> {
         storage_rx,
         metrics_client.clone(),
         config_arc.redis_url.clone(),
+        config_arc.clear_redis,
         Some(snapshot_state.clone()),
         config_arc.snapshot_launch_limit,
         config_arc.snapshot_trade_limit,
@@ -154,6 +156,7 @@ async fn main() -> anyhow::Result<()> {
         let storage_tx = storage_tx_for_retry.clone();
         let health_state = Arc::clone(&health_state_for_retry);
         let snapshot_state = Arc::clone(&snapshot_state_for_retry);
+        let redis_client_retry = redis_client_for_handler.clone();
         let mut shutdown_rx = shutdown_rx.clone();
 
         async move {
@@ -207,7 +210,7 @@ async fn main() -> anyhow::Result<()> {
                 .context("subscribe")?;
 
             tokio::select! {
-                result = handle_stream_updates(stream, subscribe_tx, (*config).clone(), ws_server, parser_map, metrics_client, storage_tx, Some(health_state), Some(snapshot_state)) => {
+                result = handle_stream_updates(stream, subscribe_tx, (*config).clone(), ws_server.clone(), parser_map.clone(), metrics_client.clone(), storage_tx.clone(), Some(health_state.clone()), Some(snapshot_state.clone()), redis_client_retry.clone()) => {
                     result.map_err(|e| {
                         error!("Stream: {}", e);
                         BackoffError::transient(e)

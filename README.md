@@ -15,21 +15,13 @@ Central WebSocket server for streaming token and trade data to trading terminals
 
 ## Build & run
 
-```bash
-cargo build --release
-```
+See **[docs/RUNNING.md](docs/RUNNING.md)** for detailed instructions on development and production deployment (nohup, systemd).
 
+Quick Dev Start:
 ```bash
-# Required for config validation
 export GRPC_ENDPOINT="https://..."
-
-# Optional
-export WS_PORT=5566
-export WS_MAX_CONNECTIONS=2000
-export WS_MAX_LAG_DROP=5000
-export RUST_LOG=info
-
-cargo run --release
+export REDIS_URL="redis://127.0.0.1:6379"
+cargo run
 ```
 
 The process stays running and serves WebSocket on `ws://0.0.0.0:<WS_PORT>` (default 5566).

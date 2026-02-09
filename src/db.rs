@@ -1,6 +1,6 @@
 use clickhouse::{Client, Row};
 use serde::{Deserialize, Serialize};
-use tracing::{error, info};
+use tracing::{debug, error};
 
 const TABLE: &str = "pipeline_metrics";
 
@@ -43,7 +43,7 @@ pub async fn ensure_table(client: &Client) -> clickhouse::error::Result<()> {
         "#
     );
     client.query(&ddl).execute().await?;
-    info!("ClickHouse table {} ensured", TABLE);
+    debug!("ClickHouse table {} ensured", TABLE);
     Ok(())
 }
 
@@ -144,6 +144,19 @@ pub struct TokenLaunchRow {
     pub symbol: String,
     pub uri: String,
     pub creator: String,
+    pub bonding_curve: Option<String>,
+    pub associated_bonding_curve: Option<String>,
+    pub global: Option<String>,
+    pub fee_recipient: Option<String>,
+    pub metadata: Option<String>,
+    pub creator_vault: Option<String>,
+    pub fee_config: Option<String>,
+    pub event_authority: Option<String>,
+    pub token_decimals: u8,
+    pub virtual_sol_reserves: Option<u64>,
+    pub virtual_token_reserves: Option<u64>,
+    pub real_sol_reserves: Option<u64>,
+    pub real_token_reserves: Option<u64>,
     pub received_at: u64,
     pub sent_at: u64,
 }
@@ -160,6 +173,8 @@ pub struct TradeRow {
     pub virtual_token_reserves: u64,
     pub is_create: u8,
     pub pool: Option<String>,
+    pub token_decimals: u8,
+    pub suggested_compute_unit_limit: u32,
     pub received_at: u64,
     pub sent_at: u64,
 }
@@ -190,16 +205,29 @@ pub async fn ensure_token_launches_table(client: &Client) -> clickhouse::error::
             symbol LowCardinality(String),
             uri String,
             creator LowCardinality(String),
+            bonding_curve Nullable(String),
+            associated_bonding_curve Nullable(String),
+            global Nullable(String),
+            fee_recipient Nullable(String),
+            metadata Nullable(String),
+            creator_vault Nullable(String),
+            fee_config Nullable(String),
+            event_authority Nullable(String),
+            token_decimals UInt8,
+            virtual_sol_reserves Nullable(UInt64),
+            virtual_token_reserves Nullable(UInt64),
+            real_sol_reserves Nullable(UInt64),
+            real_token_reserves Nullable(UInt64),
             received_at UInt64 CODEC(Delta, ZSTD(3)),
             sent_at UInt64 CODEC(Delta, ZSTD(3))
         )
         ENGINE = ReplacingMergeTree(received_at)
-        PARTITION BY toYYYYMM(toDateTime(slot / 2))
+        PARTITION BY toYYYYMM(toDateTime(received_at / 1000000))
         ORDER BY signature
         "#
     );
     client.query(&ddl).execute().await?;
-    info!("ClickHouse table {} ensured", TABLE_TOKEN_LAUNCHES);
+    debug!("ClickHouse table {} ensured", TABLE_TOKEN_LAUNCHES);
     Ok(())
 }
 
@@ -217,16 +245,18 @@ pub async fn ensure_trades_table(client: &Client) -> clickhouse::error::Result<(
             virtual_token_reserves UInt64 CODEC(Delta, ZSTD(3)),
             is_create UInt8,
             pool LowCardinality(Nullable(String)),
+            token_decimals UInt8,
+            suggested_compute_unit_limit UInt32,
             received_at UInt64 CODEC(Delta, ZSTD(3)),
             sent_at UInt64 CODEC(Delta, ZSTD(3))
         )
         ENGINE = ReplacingMergeTree(received_at)
-        PARTITION BY toYYYYMM(toDateTime(slot / 2))
+        PARTITION BY toYYYYMM(toDateTime(received_at / 1000000))
         ORDER BY signature
         "#
     );
     client.query(&ddl).execute().await?;
-    info!("ClickHouse table {} ensured", TABLE_TRADES);
+    debug!("ClickHouse table {} ensured", TABLE_TRADES);
     Ok(())
 }
 
@@ -247,12 +277,12 @@ pub async fn ensure_migrations_table(client: &Client) -> clickhouse::error::Resu
             sent_at UInt64 CODEC(Delta, ZSTD(3))
         )
         ENGINE = ReplacingMergeTree(received_at)
-        PARTITION BY toYYYYMM(toDateTime(slot / 2))
+        PARTITION BY toYYYYMM(toDateTime(received_at / 1000000))
         ORDER BY signature
         "#
     );
     client.query(&ddl).execute().await?;
-    info!("ClickHouse table {} ensured", TABLE_MIGRATIONS);
+    debug!("ClickHouse table {} ensured", TABLE_MIGRATIONS);
     Ok(())
 }
 
@@ -262,7 +292,7 @@ pub async fn drop_tables(client: &Client) -> clickhouse::error::Result<()> {
             .query(&format!("DROP TABLE IF EXISTS {}", table))
             .execute()
             .await?;
-        info!("ClickHouse table {} dropped", table);
+        debug!("ClickHouse table {} dropped", table);
     }
     Ok(())
 }

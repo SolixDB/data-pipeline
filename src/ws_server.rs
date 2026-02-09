@@ -198,7 +198,7 @@ async fn handle_connection(
     if let Some(ref state) = server.snapshot_state {
         // Avoid race: if snapshot is empty, give storage worker a short time to populate (e.g. first connect)
         let mut snap = state.read().await.clone();
-        for attempt in 0..5 {
+        for attempt in 0..20 {
             if !snap.launches.is_empty() {
                 break;
             }

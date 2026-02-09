@@ -24,6 +24,10 @@ const MAX_RECENT_MIGRATIONS: usize = 10_000;
 const BATCH_SIZE: usize = 100;
 /// Or when this much time has passed
 const FLUSH_INTERVAL_MS: u64 = 50;
+/// Redis key for bonding curve mapping (for enrichment)
+const REDIS_KEY_BONDING_CURVES: &str = "bonding_curves";
+/// Redis key for ticker validation
+pub const REDIS_KEY_TICKERS: &str = "snapshot:tickers";
 
 pub enum StorageMessage {
     TokenLaunch(TokenLaunch),
@@ -107,6 +111,7 @@ pub fn spawn_storage_worker(
     mut rx: mpsc::Receiver<StorageMessage>,
     clickhouse: Option<Arc<Client>>,
     redis_url: Option<String>,
+    clear_redis: bool,
     snapshot_state: Option<Arc<RwLock<SnapshotState>>>,
     snapshot_launch_limit: usize,
     snapshot_trade_limit: usize,
@@ -140,6 +145,113 @@ pub fn spawn_storage_worker(
                     redis_conn = Some(conn);
                     info!("Redis connected for snapshots");
                 }
+            }
+        }
+
+        // Clear Redis if requested
+        if clear_redis {
+            if let Some(ref mut conn) = redis_conn {
+                use redis::AsyncCommands;
+                let keys_to_delete = vec![REDIS_KEY_LAUNCHES, REDIS_KEY_TRADES, REDIS_KEY_MIGRATED, REDIS_KEY_BONDING_CURVES, REDIS_KEY_TICKERS];
+                for key in keys_to_delete {
+                    if let Err(e) = conn.del::<_, ()>(key).await {
+                        warn!("Failed to delete Redis key {}: {:?}", key, e);
+                    }
+                }
+                info!("Redis snapshot keys cleared");
+            } else {
+                warn!("CLEAR_REDIS is set but Redis is not connected");
+            }
+        }
+
+        if let Some(ref mut conn) = redis_conn {
+            info!("Hydrating state from Redis...");
+            
+            // 1. Launches
+            if let Ok(json) = conn.get::<_, String>(REDIS_KEY_LAUNCHES).await {
+                if let Ok(launches) = serde_json::from_str::<Vec<TokenLaunchPayload>>(&json) {
+                    for launch in launches.into_iter().rev() { // iterate oldest to newest
+                        last_launches.push_front(launch.clone());
+                        recent_mints.insert(launch.mint.clone());
+                        if let Some(state) = launch.initial_bonding_curve_state {
+                            curve_reserves.insert(launch.mint.clone(), state.virtual_token_reserves);
+                        }
+                        // Populate bonding curve hash in Redis (idempotent)
+                        if let Some(ref bc) = launch.pump_accounts.bonding_curve {
+                            let _: redis::RedisResult<()> = conn.hset(REDIS_KEY_BONDING_CURVES, &launch.mint, bc).await;
+                        }
+                    }
+                    // Trim to limit
+                    while last_launches.len() > launch_limit {
+                         last_launches.pop_back();
+                    }
+                    info!("Loaded {} launches from Redis", last_launches.len());
+                }
+            }
+
+            // 2. Trades
+            if let Ok(json) = conn.get::<_, String>(REDIS_KEY_TRADES).await {
+                 if let Ok(trades) = serde_json::from_str::<Vec<Trade>>(&json) {
+                    for trade in trades {
+                        if recent_mints.contains(&trade.mint) {
+                            recent_trades.push_back(trade.clone());
+                            // Update curve reserves from trade
+                            if trade.is_bonding_curve {
+                                curve_reserves.insert(trade.mint.clone(), trade.virtual_token_reserves);
+                            }
+                        }
+                    }
+                     // Trim
+                    while recent_trades.len() > trade_limit {
+                        recent_trades.pop_front();
+                    }
+                }
+            }
+
+            // 3. Tickers
+            if let Ok(json) = conn.get::<_, String>(REDIS_KEY_TICKERS).await {
+                if let Ok(loaded_tickers) = serde_json::from_str::<HashMap<String, TokenState>>(&json) {
+                    if let Some(ref state) = snapshot_state {
+                        let mut w = state.write().await;
+                        // Use extend to merge loaded tickers with any that might have been created by live handler already
+                        w.tickers.extend(loaded_tickers.clone()); 
+                        info!("Loaded {} tickers from Redis", loaded_tickers.len());
+                    }
+                }
+            }
+
+            // 4. Migrated
+            if let Ok(json) = conn.get::<_, String>(REDIS_KEY_MIGRATED).await {
+                if let Ok(migrated) = serde_json::from_str::<Vec<MigratedEntry>>(&json) {
+                    migrated_list = migrated;
+                    // Remove migrated from curve_reserves
+                    for m in &migrated_list {
+                        curve_reserves.remove(&m.mint);
+                    }
+                    info!("Loaded {} migrations from Redis", migrated_list.len());
+                }
+            }
+            
+            // Update initial snapshot state
+            if let Some(ref state) = snapshot_state {
+                 let mut w = state.write().await;
+                 w.migrated = migrated_list.clone();
+                 w.launches = last_launches.iter().cloned().collect();
+                 w.trades = recent_trades.iter().cloned().collect();
+                 
+                 // Recompute soon_migrating
+                 w.soon_migrating = curve_reserves
+                    .iter()
+                    .filter_map(|(mint, &reserves)| {
+                        let progress = 1.0 - (reserves as f64 / INITIAL_VIRTUAL_TOKEN_RESERVES as f64);
+                        let pct = (progress * 100.0).clamp(0.0, 100.0);
+                        (pct >= SOON_MIGRATING_PROGRESS_PCT).then(|| SoonMigratingEntry {
+                            mint: mint.clone(),
+                            progress_pct: pct,
+                            virtual_token_reserves: reserves,
+                        })
+                    })
+                    .collect();
             }
         }
 
@@ -185,6 +297,19 @@ pub fn spawn_storage_worker(
                             symbol: launch.symbol,
                             uri: launch.uri,
                             creator: launch.creator,
+                            bonding_curve: launch.pump_accounts.bonding_curve.clone(),
+                            associated_bonding_curve: launch.pump_accounts.associated_bonding_curve.clone(),
+                            global: launch.pump_accounts.global.clone(),
+                            fee_recipient: launch.pump_accounts.fee_recipient.clone(),
+                            metadata: launch.pump_accounts.metadata.clone(),
+                            creator_vault: launch.pump_accounts.creator_vault.clone(),
+                            fee_config: launch.pump_accounts.fee_config.clone(),
+                            event_authority: launch.pump_accounts.event_authority.clone(),
+                            token_decimals: launch.token_decimals,
+                            virtual_sol_reserves: launch.initial_bonding_curve_state.as_ref().map(|s| s.virtual_sol_reserves),
+                            virtual_token_reserves: launch.initial_bonding_curve_state.as_ref().map(|s| s.virtual_token_reserves),
+                            real_sol_reserves: launch.initial_bonding_curve_state.as_ref().map(|s| s.real_sol_reserves),
+                            real_token_reserves: launch.initial_bonding_curve_state.as_ref().map(|s| s.real_token_reserves),
                             received_at: launch.received_at,
                             sent_at: launch.sent_at,
                         });
@@ -218,12 +343,14 @@ pub fn spawn_storage_worker(
                             virtual_token_reserves: trade.virtual_token_reserves,
                             is_create: trade.is_create as u8,
                             pool: trade.pool.clone(),
+                            token_decimals: trade.token_decimals,
+                            suggested_compute_unit_limit: trade.suggested_compute_unit_limit,
                             received_at: trade.received_at,
                             sent_at: trade.sent_at,
                         });
                     }
 
-                    if trade.pool.is_none() {
+                    if trade.is_bonding_curve {
                         curve_reserves.insert(trade.mint, trade.virtual_token_reserves);
                     }
                 }
@@ -305,46 +432,38 @@ pub fn spawn_storage_worker(
                 .collect();
 
             // SnapshotState (WS)
+            let mut tickers_map_clone = HashMap::new();
             if let Some(ref state) = snapshot_state {
                 let mut w = state.write().await;
                 w.migrated = migrated_list.clone();
                 w.soon_migrating = soon_migrating.clone();
                 w.launches = last_launches.iter().cloned().collect();
                 w.trades = recent_trades.iter().cloned().collect();
-            }
+                
+                // Clone map quickly while holding lock (fast)
+                tickers_map_clone = w.tickers.clone();
+            } // Lock released
 
-            // Redis snapshots (optional)
+            // Redis snapshots (async to avoid blocking)
             if let Some(ref mut conn) = redis_conn {
-                let _: redis::RedisResult<()> = conn
-                    .set(
-                        REDIS_KEY_MIGRATED,
-                        serde_json::to_string(&migrated_list).unwrap_or_default(),
-                    )
-                    .await;
+                // Serialize OUTSIDE the lock (cpu intensive)
+                let migrated_json = serde_json::to_string(&migrated_list).unwrap_or_default();
+                let soon_migrating_json = serde_json::to_string(&soon_migrating).unwrap_or_default();
+                let launches_json = serde_json::to_string(&last_launches.iter().cloned().collect::<Vec<_>>()).unwrap_or_default();
+                let trades_json = serde_json::to_string(&recent_trades.iter().cloned().collect::<Vec<_>>()).unwrap_or_default();
+                let tickers_json = serde_json::to_string(&tickers_map_clone).unwrap_or_default();
 
-                let _: redis::RedisResult<()> = conn
-                    .set(
-                        REDIS_KEY_SOON_MIGRATING,
-                        serde_json::to_string(&soon_migrating).unwrap_or_default(),
-                    )
-                    .await;
-
-                let launches: Vec<_> = last_launches.iter().cloned().collect();
-                let trades: Vec<_> = recent_trades.iter().cloned().collect();
-
-                let _: redis::RedisResult<()> = conn
-                    .set(
-                        REDIS_KEY_LAUNCHES,
-                        serde_json::to_string(&launches).unwrap_or_default(),
-                    )
-                    .await;
-
-                let _: redis::RedisResult<()> = conn
-                    .set(
-                        REDIS_KEY_TRADES,
-                        serde_json::to_string(&trades).unwrap_or_default(),
-                    )
-                    .await;
+                // Get a MultiplexedConnection clone which is cheap and thread-safe
+                let mut conn_clone = conn.clone();
+                tokio::spawn(async move {
+                    let _: redis::RedisResult<()> = conn_clone.set(REDIS_KEY_MIGRATED, migrated_json).await;
+                    let _: redis::RedisResult<()> = conn_clone.set(REDIS_KEY_SOON_MIGRATING, soon_migrating_json).await;
+                    let _: redis::RedisResult<()> = conn_clone.set(REDIS_KEY_LAUNCHES, launches_json).await;
+                    let _: redis::RedisResult<()> = conn_clone.set(REDIS_KEY_TRADES, trades_json).await;
+                    if !tickers_json.is_empty() {
+                         let _: redis::RedisResult<()> = conn_clone.set(REDIS_KEY_TICKERS, tickers_json).await;
+                    }
+                });
             }
         }
 

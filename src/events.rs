@@ -53,20 +53,28 @@ impl Default for PumpProtocolConstants {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct PumpFunBondingCurveAccounts {
     /// Bonding curve PDA: seeds ["bonding-curve", mint], program = Pump.fun
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub bonding_curve: Option<String>,
     /// Associated bonding curve (token account) for the bonding curve PDA.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub associated_bonding_curve: Option<String>,
     /// Global config PDA: seeds ["global"], program = Pump.fun.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub global: Option<String>,
     /// Fee recipient (from Global account). Filled when same-tx Buy instruction is present.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub fee_recipient: Option<String>,
     /// Metaplex metadata PDA for this mint (for Create flow).
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub metadata: Option<String>,
     /// Creator vault PDA: seeds ["creator-vault", creator], program = Pump.fun
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub creator_vault: Option<String>,
     /// Fee config PDA: seeds ["fee_config", pump_fun_program_id], program = Pump fee program
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub fee_config: Option<String>,
     /// Event authority PDA: seeds ["__event_authority"], program = Pump.fun.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub event_authority: Option<String>,
 }
 
@@ -103,6 +111,10 @@ fn default_token_decimals() -> u8 {
     6
 }
 
+fn default_true() -> bool {
+    true
+}
+
 /// Trade direction.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -129,6 +141,9 @@ pub struct Trade {
     pub liquidity_sol: f64,
     pub fee: u64,
     pub is_create: bool,
+    /// Internal flag to distinguish bonding curve trades from AMM trades
+    #[serde(default = "default_true")]
+    pub is_bonding_curve: bool,
     /// Set for AMM (pump_amm) trades after migration; None for bonding-curve trades.
     #[serde(default)]
     pub pool: Option<String>,

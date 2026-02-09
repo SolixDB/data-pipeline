@@ -17,6 +17,8 @@ pub struct Config {
     pub redis_url: Option<String>,
     /// When true, TRUNCATE pipeline ClickHouse tables on startup (for dev).
     pub clear_clickhouse: bool,
+    /// When true, clear Redis snapshot keys on startup (for dev).
+    pub clear_redis: bool,
     /// When true, do not connect or write to ClickHouse (Redis/WS still work).
     pub skip_clickhouse: bool,
     /// When true, clear ClickHouse (drop + recreate tables) then do not write any data this run.
@@ -47,6 +49,10 @@ impl Default for Config {
             clickhouse_password: env::var("CLICKHOUSE_PASSWORD").ok().filter(|s| !s.is_empty()),
             redis_url: env::var("REDIS_URL").ok().filter(|s| !s.is_empty()),
             clear_clickhouse: env::var("CLEAR_CLICKHOUSE")
+                .ok()
+                .map(|s| matches!(s.to_lowercase().as_str(), "1" | "true" | "yes"))
+                .unwrap_or(false),
+            clear_redis: env::var("CLEAR_REDIS")
                 .ok()
                 .map(|s| matches!(s.to_lowercase().as_str(), "1" | "true" | "yes"))
                 .unwrap_or(false),

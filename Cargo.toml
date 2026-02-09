@@ -149,3 +149,10 @@ clickhouse.workspace = true
 
 # Redis (snapshot cache)
 redis.workspace = true
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true
