@@ -80,7 +80,7 @@ Same struct as events::Migration. Fields: signature, slot, mint, user, bonding_c
 
 **SnapshotLaunches** and **SnapshotTrades** use the same payload types as live `TokenLaunch` and `Trade`; treat them the same in the UI (e.g. push into the same lists).
 
-**TokenState** (SnapshotTickers): `mint`, `price`, `market_cap`, `liquidity_sol`, `volume_sol`, `tx_count`, `last_slot`.
+**TokenState** (SnapshotTickers): `mint`, `price`, `market_cap`, `liquidity_sol`, `volume_5m`, `volume_1h`, `volume_6h`, `volume_24h`, `tx_count_5m`, `tx_count_1h`, `tx_count_6h`, `tx_count_24h`, `total_fees_sol`, `last_slot`. Note: `trade_history` and `last_cleanup_micros` are internal fields not sent to clients.
 
 ---
 

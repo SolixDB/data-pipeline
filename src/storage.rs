@@ -17,7 +17,7 @@ use tracing::{info, warn};
 /// Initial Pump.fun bonding curve virtual token reserves
 const INITIAL_VIRTUAL_TOKEN_RESERVES: u64 = 1_073_000_000_000_000;
 /// Above this percent, token is considered "soon migrating"
-const SOON_MIGRATING_PROGRESS_PCT: f64 = 80.0;
+const SOON_MIGRATING_PROGRESS_PCT: f64 = 75.0;
 /// Bound in-memory migrated snapshot
 const MAX_RECENT_MIGRATIONS: usize = 10_000;
 /// Flush ClickHouse when any buffer reaches this size
@@ -50,15 +50,66 @@ pub struct SoonMigratingEntry {
     pub virtual_token_reserves: u64,
 }
 
+/// Trade entry for time-windowed volume calculation
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct TradeEntry {
+    pub timestamp_micros: u64,
+    pub sol_amount: f64,
+}
+
+/// Time-windowed volume metrics
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct VolumeMetrics {
+    pub volume_5m: f64,
+    pub volume_1h: f64,
+    pub volume_6h: f64,
+    pub volume_24h: f64,
+    pub tx_count_5m: u64,
+    pub tx_count_1h: u64,
+    pub tx_count_6h: u64,
+    pub tx_count_24h: u64,
+}
+
+impl Default for VolumeMetrics {
+    fn default() -> Self {
+        Self {
+            volume_5m: 0.0,
+            volume_1h: 0.0,
+            volume_6h: 0.0,
+            volume_24h: 0.0,
+            tx_count_5m: 0,
+            tx_count_1h: 0,
+            tx_count_6h: 0,
+            tx_count_24h: 0,
+        }
+    }
+}
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct TokenState {
     pub mint: String,
     pub price: f64,
     pub market_cap: f64,
     pub liquidity_sol: f64,
-    pub volume_sol: f64,
-    pub tx_count: u64,
+    
+    // Time-windowed metrics
+    #[serde(flatten)]
+    pub volume_metrics: VolumeMetrics,
+    
+    // Cumulative fees earned by token creator (all-time, from both pump.fun and pump_amm)
+    #[serde(default)]
+    pub total_fees_sol: f64,
+    
+    // Circular buffer for trade history (last 24h max, ~2880 trades if 30s avg)
+    // We keep this reasonably sized - 5000 trades should cover high-frequency tokens
+    #[serde(default)]
+    pub trade_history: VecDeque<TradeEntry>,
+    
     pub last_slot: u64,
+    
+    // Last cleanup timestamp to avoid recalculating on every trade
+    #[serde(default)]
+    pub last_cleanup_micros: u64,
 }
 
 impl TokenState {
@@ -68,10 +119,120 @@ impl TokenState {
             price: 0.0,
             market_cap: 0.0,
             liquidity_sol: 0.0,
-            volume_sol: 0.0,
-            tx_count: 0,
+            volume_metrics: VolumeMetrics::default(),
+            total_fees_sol: 0.0,
+            trade_history: VecDeque::with_capacity(5000),
             last_slot: 0,
+            last_cleanup_micros: 0,
         }
+    }
+    
+    /// Add a trade and update time-windowed volumes
+    /// This is O(1) amortized - cleanup only runs periodically
+    pub fn add_trade(&mut self, timestamp_micros: u64, sol_amount: f64) {
+        // Add to circular buffer
+        self.trade_history.push_back(TradeEntry {
+            timestamp_micros,
+            sol_amount,
+        });
+        
+        // Limit buffer size (drop oldest if exceeds capacity)
+        if self.trade_history.len() > 5000 {
+            self.trade_history.pop_front();
+        }
+        
+        // Cleanup old trades periodically (every 60 seconds)
+        let should_cleanup = self.last_cleanup_micros == 0 
+            || timestamp_micros - self.last_cleanup_micros > 60_000_000;
+        
+        if should_cleanup {
+            self.cleanup_and_recalculate(timestamp_micros);
+            self.last_cleanup_micros = timestamp_micros;
+        } else {
+            // Fast path: add to appropriate windows based on current time
+            // Use current system time as reference to handle out-of-order trades correctly
+            let current_time = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_micros() as u64;
+            
+            let trade_age = current_time.saturating_sub(timestamp_micros);
+            
+            // Time windows in microseconds
+            const WINDOW_5M: u64 = 5 * 60 * 1_000_000;
+            const WINDOW_1H: u64 = 60 * 60 * 1_000_000;
+            const WINDOW_6H: u64 = 6 * 60 * 60 * 1_000_000;
+            const WINDOW_24H: u64 = 24 * 60 * 60 * 1_000_000;
+            
+            // Only add to windows where the trade actually belongs
+            if trade_age <= WINDOW_5M {
+                self.volume_metrics.volume_5m += sol_amount;
+                self.volume_metrics.tx_count_5m += 1;
+            }
+            if trade_age <= WINDOW_1H {
+                self.volume_metrics.volume_1h += sol_amount;
+                self.volume_metrics.tx_count_1h += 1;
+            }
+            if trade_age <= WINDOW_6H {
+                self.volume_metrics.volume_6h += sol_amount;
+                self.volume_metrics.tx_count_6h += 1;
+            }
+            if trade_age <= WINDOW_24H {
+                self.volume_metrics.volume_24h += sol_amount;
+                self.volume_metrics.tx_count_24h += 1;
+            }
+        }
+    }
+    
+    /// Remove trades older than 24h and recalculate all windows
+    /// Called periodically (every 60s) to keep metrics accurate
+    fn cleanup_and_recalculate(&mut self, current_time_micros: u64) {
+        // Time windows in microseconds
+        const WINDOW_5M: u64 = 5 * 60 * 1_000_000;
+        const WINDOW_1H: u64 = 60 * 60 * 1_000_000;
+        const WINDOW_6H: u64 = 6 * 60 * 60 * 1_000_000;
+        const WINDOW_24H: u64 = 24 * 60 * 60 * 1_000_000;
+        
+        // Remove trades older than 24h
+        while let Some(oldest) = self.trade_history.front() {
+            if current_time_micros - oldest.timestamp_micros > WINDOW_24H {
+                self.trade_history.pop_front();
+            } else {
+                break;
+            }
+        }
+        
+        // Recalculate all windows from scratch
+        let mut metrics = VolumeMetrics::default();
+        
+        for trade in &self.trade_history {
+            let age = current_time_micros.saturating_sub(trade.timestamp_micros);
+            
+            if age <= WINDOW_5M {
+                metrics.volume_5m += trade.sol_amount;
+                metrics.tx_count_5m += 1;
+            }
+            if age <= WINDOW_1H {
+                metrics.volume_1h += trade.sol_amount;
+                metrics.tx_count_1h += 1;
+            }
+            if age <= WINDOW_6H {
+                metrics.volume_6h += trade.sol_amount;
+                metrics.tx_count_6h += 1;
+            }
+            if age <= WINDOW_24H {
+                metrics.volume_24h += trade.sol_amount;
+                metrics.tx_count_24h += 1;
+            }
+        }
+        
+        self.volume_metrics = metrics;
+    }
+    
+    /// Force recalculation (useful after loading from Redis)
+    pub fn recalculate_volumes(&mut self, current_time_micros: u64) {
+        self.cleanup_and_recalculate(current_time_micros);
+        self.last_cleanup_micros = current_time_micros;
     }
 }
 
@@ -210,12 +371,22 @@ pub fn spawn_storage_worker(
 
             // 3. Tickers
             if let Ok(json) = conn.get::<_, String>(REDIS_KEY_TICKERS).await {
-                if let Ok(loaded_tickers) = serde_json::from_str::<HashMap<String, TokenState>>(&json) {
+                if let Ok(mut loaded_tickers) = serde_json::from_str::<HashMap<String, TokenState>>(&json) {
                     if let Some(ref state) = snapshot_state {
+                        // Recalculate volumes for all loaded tickers based on current time
+                        let current_time = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_micros() as u64;
+                        
+                        for ticker in loaded_tickers.values_mut() {
+                            ticker.recalculate_volumes(current_time);
+                        }
+                        
                         let mut w = state.write().await;
                         // Use extend to merge loaded tickers with any that might have been created by live handler already
                         w.tickers.extend(loaded_tickers.clone()); 
-                        info!("Loaded {} tickers from Redis", loaded_tickers.len());
+                        info!("Loaded {} tickers from Redis (volumes recalculated)", loaded_tickers.len());
                     }
                 }
             }

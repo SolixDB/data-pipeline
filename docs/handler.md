@@ -56,8 +56,10 @@ Runs until the stream ends or errors. Returns `anyhow::Result<()>`; stream error
 5. **Trades:** For each trade:
    - **Filter:** Skip if mint not in `known_mints` (ignore trades for tokens we didn't see launch).
    - **Enrich:** If `pool` is missing (Bonding Curve trade via CPI), fetch from Redis (`bonding_curves`).
-   - Update `TokenState` in `SnapshotState`: `price`, `market_cap`, `liquidity_sol` from trade; add `sol_amount` to `volume_sol`; increment `tx_count`.
-   - Set `trade.volume_sol` and `trade.tx_count` from updated state.
+   - Update `TokenState` in `SnapshotState`: `price`, `market_cap`, `liquidity_sol` from trade; add trade to time-windowed volume tracking using `add_trade()` method.
+   - The `add_trade()` method maintains circular buffers and calculates volume across multiple time windows: 5m, 1h, 6h, 24h.
+   - Cleanup of old trades (>24h) happens automatically every 60 seconds to keep memory bounded.
+   - Set `trade.volume_sol` and `trade.tx_count` from 24h window for backward compatibility.
    - Set `sent_at`, `storage_tx.send(StorageMessage::Trade(trade)).await`, serialize `ServerMessage::Trade(trade)`, broadcast, log at debug.
 6. **Migrations:** `migrations = multi_parser::parse_migration_events(...)`; for each: set `sent_at`, `storage_tx.send(StorageMessage::Migration(migration)).await`, serialize and broadcast, log at debug.
 
