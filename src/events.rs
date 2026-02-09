@@ -66,6 +66,8 @@ pub struct PumpFunBondingCurveAccounts {
     pub creator_vault: Option<String>,
     /// Fee config PDA: seeds ["fee_config", pump_fun_program_id], program = Pump fee program
     pub fee_config: Option<String>,
+    /// Event authority PDA: seeds ["__event_authority"], program = Pump.fun.
+    pub event_authority: Option<String>,
 }
 
 /// Token launch event (pump.fun Create).

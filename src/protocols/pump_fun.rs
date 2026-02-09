@@ -12,8 +12,10 @@ const TRADE_EVENT_MIN_SIZE: usize = 8 + 32 + 8 + 8 + 1 + 32 + 8 + 8 + 8 + 8 + 8 
 /// completePumpAmmMigrationEvent: 8(disc) + user(32) + mint(32) + mintAmount(8) + solAmount(8) + fee(8) + bondingCurve(32) + timestamp(8) + pool(32).
 const MIGRATION_EVENT_MIN_SIZE: usize = 8 + 32 + 32 + 8 + 8 + 8 + 32 + 8 + 32;
 
-const PUMP_FUN_PROGRAM_ID: &str = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P";
-const PUMP_FUN_FEE_PROGRAM_ID: &str = "pfeeUxB6jkeY1Hxd7CsFCAjcbHA9rWtchMGdZ6VojVZ";
+// Mainnet Fee Recipient for Pump.fun
+pub const PUMP_FUN_FEE_RECIPIENT: &str = "CebN5WGQ4jvEPvsVU4EoHEpgzq1VV7AbicfhtW4xC9iM";
+pub const PUMP_FUN_PROGRAM_ID: &str = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P";
+pub const PUMP_FUN_FEE_PROGRAM_ID: &str = "pfeeUxB6jkeY1Hxd7CsFCAjcbHA9rWtchMGdZ6VojVZ";
 
 pub fn has_create_in_logs(ix: &InstructionUpdate) -> bool {
     ix.shared.log_messages.iter().any(|l| {
@@ -118,14 +120,21 @@ pub fn parse_create(ix: &InstructionUpdate, received_at: u64) -> Option<crate::e
         &fee_program,
     );
 
+    // event_authority: ["__event_authority"] - program: pump_program
+    let (event_authority_pda, _) = Pubkey::find_program_address(
+        &[b"__event_authority"],
+        &pump_program,
+    );
+
     let pump_accounts = crate::events::PumpFunBondingCurveAccounts {
         bonding_curve,
         associated_bonding_curve,
         global,
-        fee_recipient: None,
+        fee_recipient: Some(PUMP_FUN_FEE_RECIPIENT.to_string()),
         metadata,
         creator_vault: Some(creator_vault_pda.to_string()),
         fee_config: Some(fee_config_pda.to_string()),
+        event_authority: Some(event_authority_pda.to_string()),
     };
     Some(crate::events::TokenLaunch {
         signature,
