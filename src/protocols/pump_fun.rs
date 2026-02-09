@@ -250,7 +250,13 @@ fn decode_trade_event(
         received_at: receive_ts,
         sent_at: 0,
         volume_sol: 0.0,
+        volume_5m: 0.0,
+        volume_1h: 0.0,
+        volume_6h: 0.0,
         tx_count: 0,
+        tx_count_5m: 0,
+        tx_count_1h: 0,
+        tx_count_6h: 0,
         total_fees_sol: 0.0,
     })
 }

@@ -231,7 +231,15 @@ async fn handle_transaction(
             
             // Populate trade with current volume metrics (24h volume for backward compatibility)
             trade.volume_sol = token_state.volume_metrics.volume_24h;
+            trade.volume_5m = token_state.volume_metrics.volume_5m;
+            trade.volume_1h = token_state.volume_metrics.volume_1h;
+            trade.volume_6h = token_state.volume_metrics.volume_6h;
+            
             trade.tx_count = token_state.volume_metrics.tx_count_24h;
+            trade.tx_count_5m = token_state.volume_metrics.tx_count_5m;
+            trade.tx_count_1h = token_state.volume_metrics.tx_count_1h;
+            trade.tx_count_6h = token_state.volume_metrics.tx_count_6h;
+            
             trade.total_fees_sol = token_state.total_fees_sol;
         }
         let count = trade_count.fetch_add(1, Ordering::Relaxed) + 1;
