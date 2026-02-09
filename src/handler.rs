@@ -7,11 +7,12 @@ use crate::multi_parser;
 use crate::storage::{StorageMessage, SnapshotState, TokenState};
 use crate::ws_server::WsServer;
 use futures::{sink::SinkExt, stream::StreamExt};
-use std::collections::HashMap;
+use redis::AsyncCommands;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use tokio::sync::{mpsc, RwLock}; // Added RwLock
-use tracing::{debug, error, warn};
+use tokio::sync::{mpsc, RwLock};
+use tracing::{debug, error, info, warn};
 use yellowstone_grpc_proto::prelude::{
     subscribe_update::UpdateOneof, SubscribeRequest, SubscribeRequestPing,
 };
@@ -28,12 +29,26 @@ pub async fn handle_stream_updates(
     storage_tx: mpsc::Sender<StorageMessage>,
     health_state: Option<Arc<HealthState>>,
     snapshot_state: Option<Arc<RwLock<SnapshotState>>>,
+    redis_client: Option<Arc<redis::Client>>,
 ) -> anyhow::Result<()> {
     let mut last_ping = std::time::Instant::now();
     let ping_interval = std::time::Duration::from_secs(30);
     let launch_count = Arc::new(AtomicU64::new(0));
     let trade_count = Arc::new(AtomicU64::new(0));
     let migration_count = Arc::new(AtomicU64::new(0));
+    
+    // Track known mints from launched tokens to filter trades (no bonding curve data in RAM)
+    let known_mints = Arc::new(RwLock::new(HashSet::<String>::new()));
+    
+    // Initialize with existing launches from snapshot
+    if let Some(state_lock) = &snapshot_state {
+        let state = state_lock.read().await;
+        let mut mints = known_mints.write().await;
+        for launch in &state.launches {
+            mints.insert(launch.mint.clone());
+        }
+        info!("Initialized known_mints with {} tokens from snapshot", mints.len());
+    }
 
     while let Some(message) = stream.next().await {
         match message {
@@ -51,6 +66,8 @@ pub async fn handle_stream_updates(
                             &storage_tx,
                             health_state.as_deref(),
                             snapshot_state.as_ref().map(|s| s.as_ref()),
+                            known_mints.clone(),
+                            redis_client.clone(),
                         )
                         .await
                         {
@@ -87,10 +104,19 @@ async fn handle_transaction(
     storage_tx: &mpsc::Sender<StorageMessage>,
     health_state: Option<&HealthState>,
     snapshot_state: Option<&RwLock<SnapshotState>>,
+    known_mints: Arc<RwLock<HashSet<String>>>,
+    redis_client: Option<Arc<redis::Client>>,
 ) -> anyhow::Result<()> {
     if let Some(h) = health_state {
         h.record_activity();
     }
+
+    if let Some(meta) = &tx_update.transaction.as_ref().and_then(|t| t.meta.as_ref()) {
+        if meta.err.is_some() {
+            return Ok(());
+        }
+    }
+
     let instructions = InstructionUpdate::parse_from_txn(tx_update)
         .map_err(|e| anyhow::anyhow!("parse_from_txn: {:?}", e))?;
     let received_at = unix_timestamp_micros();
@@ -129,6 +155,10 @@ async fn handle_transaction(
         storage_tx.send(StorageMessage::TokenLaunch(launch.clone())).await
             .map_err(|_| anyhow::anyhow!("Storage channel closed"))?;
 
+        // Clone mint and bonding curve before moving launch into payload
+        let mint_for_tracking = launch.mint.clone();
+        let bonding_curve_for_tracking = launch.pump_accounts.bonding_curve.clone().unwrap_or_default();
+
         let payload = TokenLaunchPayload {
             signature: launch.signature,
             slot: launch.slot,
@@ -146,9 +176,38 @@ async fn handle_transaction(
             ws_server.broadcast(bytes);
         }
         debug!("{} | clients={}", log_msg, ws_server.client_count());
+        
+        // Write bonding curve to Redis for future lookups (enrichment)
+        if !bonding_curve_for_tracking.is_empty() {
+             if let Some(ref r) = redis_client {
+                if let Ok(mut conn) = r.get_multiplexed_async_connection().await {
+                     let _: redis::RedisResult<()> = conn.hset("bonding_curves", &mint_for_tracking, &bonding_curve_for_tracking).await;
+                }
+            }
+        }
+        
+        // Add mint to known_mints set
+        known_mints.write().await.insert(mint_for_tracking);
     }
 
     for mut trade in trades {
+        // Filter: only process trades for tokens we've seen launched
+        if !known_mints.read().await.contains(&trade.mint) {
+            continue;
+        }
+
+        // Fix missing pool for bonding curve trades (if extraction failed due to CPI)
+        if trade.is_bonding_curve && trade.pool.is_none() {
+             if let Some(ref r) = redis_client {
+                if let Ok(mut conn) = r.get_multiplexed_async_connection().await {
+                     if let Ok(bc) = conn.hget::<_, _, String>("bonding_curves", &trade.mint).await {
+                         if !bc.is_empty() {
+                             trade.pool = Some(bc);
+                         }
+                     }
+                }
+            }
+        }
         // Update ticker state
         if let Some(state_lock) = snapshot_state {
             let mut w = state_lock.write().await;

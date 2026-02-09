@@ -24,26 +24,17 @@ pub fn has_sell_in_logs(ix: &InstructionUpdate) -> bool {
     ix.shared.log_messages.iter().any(|l| l.contains("Instruction: Sell"))
 }
 
-/// Instruction accounts for Buy/Sell: pool(0), user(1), globalConfig(2), baseMint(3), quoteMint(4), ...
-fn mint_pool_user_from_ix(ix: &InstructionUpdate) -> Option<(String, String, String)> {
-    let mint = ix.accounts.get(3).map(|p| bs58::encode(&p.0).into_string())?;
-    let pool = ix.accounts.get(0).map(|p| bs58::encode(&p.0).into_string())?;
-    let user = ix.accounts.get(1).map(|p| bs58::encode(&p.0).into_string())?;
-    Some((mint, pool, user))
-}
-
 fn decode_buy_event(
     data: &[u8],
     signature: &str,
     slot: u64,
     mint: &str,
-    pool: &str,
-    user: &str,
     received_at: u64,
 ) -> Option<Trade> {
     if data.len() < AMM_EVENT_MIN_SIZE {
         return None;
     }
+    
     let token_amount = u64::from_le_bytes(data[BUY_TOKEN_OFF..BUY_TOKEN_OFF + 8].try_into().ok()?);
     let sol_amount = u64::from_le_bytes(data[BUY_SOL_OFF..BUY_SOL_OFF + 8].try_into().ok()?);
     let pool_base = u64::from_le_bytes(data[BUY_POOL_BASE_OFF..BUY_POOL_BASE_OFF + 8].try_into().ok()?);
@@ -59,6 +50,13 @@ fn decode_buy_event(
         received_at / 1000
     };
 
+    if data.len() < 176 {
+        return None;
+    }
+
+    let pool = bs58::encode(&data[112..144]).into_string();
+    let trader = bs58::encode(&data[144..176]).into_string();
+
     let price = if pool_base > 0 {
         (pool_quote as f64) / (pool_base as f64) / 1000.0
     } else {
@@ -71,7 +69,7 @@ fn decode_buy_event(
         signature: signature.to_string(),
         slot,
         mint: mint.to_string(),
-        trader: user.to_string(),
+        trader,
         direction: TradeDirection::Buy,
         token_amount,
         sol_amount,
@@ -84,7 +82,8 @@ fn decode_buy_event(
         liquidity_sol,
         fee,
         is_create: false,
-        pool: Some(pool.to_string()),
+        is_bonding_curve: false,
+        pool: Some(pool),
         suggested_compute_unit_limit: 300_000,
         token_decimals: 6,
         txn_timestamp,
@@ -100,8 +99,6 @@ fn decode_sell_event(
     signature: &str,
     slot: u64,
     mint: &str,
-    pool: &str,
-    user: &str,
     received_at: u64,
 ) -> Option<Trade> {
     if data.len() < AMM_EVENT_MIN_SIZE {
@@ -122,6 +119,13 @@ fn decode_sell_event(
         received_at / 1000
     };
 
+    if data.len() < 176 {
+        return None;
+    }
+
+    let pool = bs58::encode(&data[112..144]).into_string();
+    let trader = bs58::encode(&data[144..176]).into_string();
+
     let price = if pool_base > 0 {
         (pool_quote as f64) / (pool_base as f64) / 1000.0
     } else {
@@ -134,7 +138,7 @@ fn decode_sell_event(
         signature: signature.to_string(),
         slot,
         mint: mint.to_string(),
-        trader: user.to_string(),
+        trader,
         direction: TradeDirection::Sell,
         token_amount,
         sol_amount,
@@ -147,7 +151,8 @@ fn decode_sell_event(
         liquidity_sol,
         fee,
         is_create: false,
-        pool: Some(pool.to_string()),
+        is_bonding_curve: false,
+        pool: Some(pool),
         suggested_compute_unit_limit: 300_000,
         token_decimals: 6,
         txn_timestamp,
@@ -158,12 +163,63 @@ fn decode_sell_event(
     })
 }
 
+fn extract_mint_from_ix(ix: &InstructionUpdate) -> Option<String> {
+    // Per IDL: buy/sell instruction accounts[3] is baseMint (for top-level instructions)
+    if let Some(mint) = ix.accounts.get(3).map(|p| bs58::encode(&p.0).into_string()) {
+        return Some(mint);
+    }
+    
+    // For inner/CPI instructions with limited accounts, look for Token Program TransferChecked
+    // The mint is at accounts[2] in TransferChecked instruction
+    let token_program = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
+    let token_2022_program = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb";
+    
+    for inner_ix in &ix.inner {
+        let program_str = bs58::encode(&inner_ix.program.0).into_string();
+        if program_str == token_program || program_str == token_2022_program {
+            // TransferChecked has mint at accounts[2]
+            if let Some(mint) = inner_ix.accounts.get(2).map(|p| bs58::encode(&p.0).into_string()) {
+                log::debug!("Extracted mint from inner Token Program TransferChecked: {}", mint);
+                return Some(mint);
+            }
+        }
+    }
+    
+    // Debug logging for failed extraction
+    log::warn!(
+        "Failed to extract mint: accounts.len()={}, inner.len()={}, program={}", 
+        ix.accounts.len(),
+        ix.inner.len(),
+        bs58::encode(&ix.program.0).into_string()
+    );
+    
+    if ix.inner.len() > 0 {
+        log::debug!("Inner instruction programs:");
+        for (i, inner) in ix.inner.iter().enumerate() {
+            log::debug!("  [{}] program={}, accounts.len()={}", 
+                i, 
+                bs58::encode(&inner.program.0).into_string(),
+                inner.accounts.len()
+            );
+        }
+    }
+    
+    None
+}
+
 pub fn parse_amm_trade_events(ix: &InstructionUpdate, received_at: u64) -> Vec<Trade> {
     use base64::Engine;
     let decoder = base64::engine::general_purpose::STANDARD;
     let signature = bs58::encode(ix.shared.signature.as_slice()).into_string();
-    let (mint, pool, user) = match mint_pool_user_from_ix(ix) {
-        Some(t) => t,
+
+    // Skip CPI calls with insufficient accounts - these are inner instructions
+    // The top-level instruction will have the full account list
+    if ix.accounts.len() < 4 {
+        return vec![];
+    }
+
+    let mint = match extract_mint_from_ix(ix) {
+        Some(m) => m,
         None => return vec![],
     };
 
@@ -183,16 +239,17 @@ pub fn parse_amm_trade_events(ix: &InstructionUpdate, received_at: u64) -> Vec<T
         };
         if data.len() < 8 + AMM_EVENT_MIN_SIZE {
             continue;
-        }
+        };
         let payload = &data[8..];
+
         if is_buy {
-            if let Some(t) = decode_buy_event(payload, &signature, ix.shared.slot, &mint, &pool, &user, received_at) {
+            if let Some(t) = decode_buy_event(payload, &signature, ix.shared.slot, &mint, received_at) {
                 out.push(t);
                 break;
             }
         }
         if is_sell {
-            if let Some(t) = decode_sell_event(payload, &signature, ix.shared.slot, &mint, &pool, &user, received_at) {
+            if let Some(t) = decode_sell_event(payload, &signature, ix.shared.slot, &mint, received_at) {
                 out.push(t);
                 break;
             }

@@ -98,7 +98,20 @@ pub fn parse_create(ix: &InstructionUpdate, received_at: u64) -> Option<crate::e
     let bonding_curve = ix.accounts.get(2).map(|p| bs58::encode(&p.0).into_string());
     let associated_bonding_curve = ix.accounts.get(3).map(|p| bs58::encode(&p.0).into_string());
     let global = ix.accounts.get(4).map(|p| bs58::encode(&p.0).into_string());
-    let metadata = ix.accounts.get(6).map(|p| bs58::encode(&p.0).into_string());
+    
+    // Derive Metadata PDA explicitly to avoid relying on account index
+    // Metadata Program ID: metaqbxxUerdq28cj1RbAWkYQm3ybzjb6a8bt518x1s
+    let metadata_program_id = Pubkey::from_str("metaqbxxUerdq28cj1RbAWkYQm3ybzjb6a8bt518x1s").unwrap_or_default();
+    let mint_pubkey = Pubkey::from_str(&mint).unwrap_or_default();
+    let (metadata_pda, _) = Pubkey::find_program_address(
+        &[
+            b"metadata",
+            metadata_program_id.as_ref(),
+            mint_pubkey.as_ref(),
+        ],
+        &metadata_program_id,
+    );
+    let metadata = Some(metadata_pda.to_string());
     let signature = bs58::encode(ix.shared.signature.as_slice()).into_string();
     let txn_timestamp = txn_timestamp_from_create_logs(ix).unwrap_or(received_at / 1000);
 
@@ -160,6 +173,7 @@ fn decode_trade_event(
     signature: &str,
     slot: u64,
     is_create: bool,
+    bonding_curve: Option<&str>,
     receive_ts: u64,
 ) -> Option<crate::events::Trade> {
     use crate::events::{Trade, TradeDirection};
@@ -228,7 +242,8 @@ fn decode_trade_event(
         liquidity_sol,
         fee,
         is_create,
-        pool: None,
+        is_bonding_curve: true,
+        pool: bonding_curve.map(|s| s.to_string()),
         suggested_compute_unit_limit: 300_000,
         token_decimals: 6,
         txn_timestamp,
@@ -245,6 +260,9 @@ pub fn parse_trade_events(ix: &InstructionUpdate, received_at: u64) -> Vec<crate
     let signature = bs58::encode(ix.shared.signature.as_slice()).into_string();
     let is_create = has_create_in_logs(ix);
 
+    // Extract bonding curve address from accounts (accounts[2] per IDL)
+    let bonding_curve = ix.accounts.get(2).map(|p| bs58::encode(&p.0).into_string());
+
     let mut out = Vec::new();
     for log in &ix.shared.log_messages {
         let Some(data_str) = log.strip_prefix("Program data: ") else {
@@ -253,7 +271,18 @@ pub fn parse_trade_events(ix: &InstructionUpdate, received_at: u64) -> Vec<crate
         let Ok(data) = decoder.decode(data_str.trim()) else {
             continue;
         };
-        if let Some(trade) = decode_trade_event(&data, &signature, ix.shared.slot, is_create, received_at) {
+        if let Some(trade) = decode_trade_event(&data, &signature, ix.shared.slot, is_create, bonding_curve.as_deref(), received_at) {
+            if trade.pool.is_none() {
+                tracing::debug!(
+                    "Parsed Pump.fun trade with NULL pool (bonding_curve not found in accounts). Signature: {}, Accounts len: {}", 
+                    signature, 
+                    ix.accounts.len()
+                );
+                // Log accounts to see what we have
+                for (i, acc) in ix.accounts.iter().enumerate() {
+                    tracing::debug!("Account {}: {}", i, bs58::encode(&acc.0).into_string());
+                }
+            }
             out.push(trade);
         }
     }
