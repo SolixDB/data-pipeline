@@ -156,6 +156,7 @@ pub struct Trade {
     pub txn_timestamp: u64,
     pub volume_sol: f64,
     pub tx_count: u64,
+    pub total_fees_sol: f64,
     pub received_at: u64,
     pub sent_at: u64,
 }

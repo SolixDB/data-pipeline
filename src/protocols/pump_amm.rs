@@ -91,6 +91,7 @@ fn decode_buy_event(
         sent_at: 0,
         volume_sol: 0.0,
         tx_count: 0,
+        total_fees_sol: 0.0,
     })
 }
 
@@ -160,6 +161,7 @@ fn decode_sell_event(
         sent_at: 0,
         volume_sol: 0.0,
         tx_count: 0,
+        total_fees_sol: 0.0,
     })
 }
 
