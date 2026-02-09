@@ -152,7 +152,7 @@ redis.workspace = true
 
 [profile.release]
 opt-level = 3
-lto = "fat"
+lto = false
 codegen-units = 1
 panic = "abort"
 strip = true
