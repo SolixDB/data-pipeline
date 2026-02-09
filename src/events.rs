@@ -54,6 +54,8 @@ impl Default for PumpProtocolConstants {
 pub struct PumpFunBondingCurveAccounts {
     /// Bonding curve PDA: seeds ["bonding-curve", mint], program = Pump.fun
     pub bonding_curve: Option<String>,
+    /// Associated bonding curve (token account) for the bonding curve PDA.
+    pub associated_bonding_curve: Option<String>,
     /// Global config PDA: seeds ["global"], program = Pump.fun.
     pub global: Option<String>,
     /// Fee recipient (from Global account). Filled when same-tx Buy instruction is present.

@@ -191,7 +191,7 @@ async fn handle_connection(
 
     // Send welcome message (MessagePack binary)
     let welcome = ServerMessage::Connected(ConnectedPayload { client_id });
-    let welcome_msg = rmp_serde::to_vec(&welcome).unwrap();
+    let welcome_msg = rmp_serde::to_vec_named(&welcome).unwrap();
     ws_sender.send(Message::Binary(welcome_msg.into())).await?;
 
     // Snapshot on connect: from in-memory state (no Redis) or from Redis when configured
@@ -215,16 +215,16 @@ async fn handle_connection(
             snap.launches.len(),
             snap.trades.len()
         );
-        if let Ok(bytes) = rmp_serde::to_vec(&ServerMessage::SnapshotMigrated(snap.migrated)) {
+        if let Ok(bytes) = rmp_serde::to_vec_named(&ServerMessage::SnapshotMigrated(snap.migrated)) {
             let _ = ws_sender.send(Message::Binary(bytes.into())).await;
         }
-        if let Ok(bytes) = rmp_serde::to_vec(&ServerMessage::SnapshotSoonMigrating(snap.soon_migrating)) {
+        if let Ok(bytes) = rmp_serde::to_vec_named(&ServerMessage::SnapshotSoonMigrating(snap.soon_migrating)) {
             let _ = ws_sender.send(Message::Binary(bytes.into())).await;
         }
-        if let Ok(bytes) = rmp_serde::to_vec(&ServerMessage::SnapshotLaunches(snap.launches.clone())) {
+        if let Ok(bytes) = rmp_serde::to_vec_named(&ServerMessage::SnapshotLaunches(snap.launches.clone())) {
             let _ = ws_sender.send(Message::Binary(bytes.into())).await;
         }
-        if let Ok(bytes) = rmp_serde::to_vec(&ServerMessage::SnapshotTrades(snap.trades)) {
+        if let Ok(bytes) = rmp_serde::to_vec_named(&ServerMessage::SnapshotTrades(snap.trades)) {
             let _ = ws_sender.send(Message::Binary(bytes.into())).await;
         }
     } else if let Some(ref redis) = server.redis_client {
@@ -233,14 +233,14 @@ async fn handle_connection(
             let soon: Result<String, _> = conn.get(crate::storage::REDIS_KEY_SOON_MIGRATING).await;
             if let Ok(json) = migrated {
                 if let Ok(entries) = serde_json::from_str::<Vec<crate::storage::MigratedEntry>>(&json) {
-                    if let Ok(bytes) = rmp_serde::to_vec(&ServerMessage::SnapshotMigrated(entries)) {
+                    if let Ok(bytes) = rmp_serde::to_vec_named(&ServerMessage::SnapshotMigrated(entries)) {
                         let _ = ws_sender.send(Message::Binary(bytes.into())).await;
                     }
                 }
             }
             if let Ok(json) = soon {
                 if let Ok(entries) = serde_json::from_str::<Vec<crate::storage::SoonMigratingEntry>>(&json) {
-                    if let Ok(bytes) = rmp_serde::to_vec(&ServerMessage::SnapshotSoonMigrating(entries)) {
+                    if let Ok(bytes) = rmp_serde::to_vec_named(&ServerMessage::SnapshotSoonMigrating(entries)) {
                         let _ = ws_sender.send(Message::Binary(bytes.into())).await;
                     }
                 }
@@ -249,14 +249,14 @@ async fn handle_connection(
             let trades: Result<String, _> = conn.get(crate::storage::REDIS_KEY_TRADES).await;
             if let Ok(json) = launches {
                 if let Ok(entries) = serde_json::from_str::<Vec<crate::messages::TokenLaunchPayload>>(&json) {
-                    if let Ok(bytes) = rmp_serde::to_vec(&ServerMessage::SnapshotLaunches(entries)) {
+                    if let Ok(bytes) = rmp_serde::to_vec_named(&ServerMessage::SnapshotLaunches(entries)) {
                         let _ = ws_sender.send(Message::Binary(bytes.into())).await;
                     }
                 }
             }
             if let Ok(json) = trades {
                 if let Ok(entries) = serde_json::from_str::<Vec<crate::events::Trade>>(&json) {
-                    if let Ok(bytes) = rmp_serde::to_vec(&ServerMessage::SnapshotTrades(entries)) {
+                    if let Ok(bytes) = rmp_serde::to_vec_named(&ServerMessage::SnapshotTrades(entries)) {
                         let _ = ws_sender.send(Message::Binary(bytes.into())).await;
                     }
                 }

@@ -1,4 +1,6 @@
 use yellowstone_vixen_core::instruction::InstructionUpdate;
+use solana_pubkey::Pubkey;
+use std::str::FromStr;
 
 /// tradeEvent layout (after 8-byte discriminator):
 /// mint(32) + sol(8) + token(8) + is_buy(1) + user(32) + timestamp(8) + reserves/fee...
@@ -7,7 +9,11 @@ const TRADE_EVENT_TIMESTAMP_OFFSET: usize = 8 + 32 + 8 + 8 + 1 + 32;
 const TRADE_EVENT_MIN_SIZE: usize = 8 + 32 + 8 + 8 + 1 + 32 + 8 + 8 + 8 + 8 + 8 + 32 + 8 + 8;
 
 /// completePumpAmmMigrationEvent: 8(disc) + user(32) + mint(32) + mintAmount(8) + solAmount(8) + fee(8) + bondingCurve(32) + timestamp(8) + pool(32).
+/// completePumpAmmMigrationEvent: 8(disc) + user(32) + mint(32) + mintAmount(8) + solAmount(8) + fee(8) + bondingCurve(32) + timestamp(8) + pool(32).
 const MIGRATION_EVENT_MIN_SIZE: usize = 8 + 32 + 32 + 8 + 8 + 8 + 32 + 8 + 32;
+
+const PUMP_FUN_PROGRAM_ID: &str = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P";
+const PUMP_FUN_FEE_PROGRAM_ID: &str = "pfeeUxB6jkeY1Hxd7CsFCAjcbHA9rWtchMGdZ6VojVZ";
 
 pub fn has_create_in_logs(ix: &InstructionUpdate) -> bool {
     ix.shared.log_messages.iter().any(|l| {
@@ -88,17 +94,38 @@ pub fn parse_create(ix: &InstructionUpdate, received_at: u64) -> Option<crate::e
         .unwrap_or_default();
     // Create instruction account order (pump_fun IDL): 0=mint, 1=mintAuthority, 2=bondingCurve, 3=associatedBondingCurve, 4=global, 5=mplTokenMetadata, 6=metadata, 7=user, ...
     let bonding_curve = ix.accounts.get(2).map(|p| bs58::encode(&p.0).into_string());
+    let associated_bonding_curve = ix.accounts.get(3).map(|p| bs58::encode(&p.0).into_string());
     let global = ix.accounts.get(4).map(|p| bs58::encode(&p.0).into_string());
     let metadata = ix.accounts.get(6).map(|p| bs58::encode(&p.0).into_string());
     let signature = bs58::encode(ix.shared.signature.as_slice()).into_string();
     let txn_timestamp = txn_timestamp_from_create_logs(ix).unwrap_or(received_at / 1000);
+
+    // Derive PDAs
+    let pump_program = Pubkey::from_str(PUMP_FUN_PROGRAM_ID).unwrap_or_default();
+    let fee_program = Pubkey::from_str(PUMP_FUN_FEE_PROGRAM_ID).unwrap_or_default();
+
+    // creator_vault: ["creator-vault", creator_pubkey]
+    let creator_bytes = &data[offset..offset + 32];
+    let (creator_vault_pda, _) = Pubkey::find_program_address(
+        &[b"creator-vault", creator_bytes],
+        &pump_program,
+    );
+
+    // fee_config: ["fee_config", pump_fun_program_id] - program: fee_program
+    // Note: docs say seeds are ["fee_config", pump_fun_program_id]
+    let (fee_config_pda, _) = Pubkey::find_program_address(
+        &[b"fee_config", pump_program.as_ref()],
+        &fee_program,
+    );
+
     let pump_accounts = crate::events::PumpFunBondingCurveAccounts {
         bonding_curve,
+        associated_bonding_curve,
         global,
         fee_recipient: None,
         metadata,
-        creator_vault: None,
-        fee_config: None,
+        creator_vault: Some(creator_vault_pda.to_string()),
+        fee_config: Some(fee_config_pda.to_string()),
     };
     Some(crate::events::TokenLaunch {
         signature,

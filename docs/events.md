@@ -56,11 +56,12 @@ PDAs and accounts for building Create/Buy/Sell on the bonding curve. All Option<
 | Field | Filled by | Meaning |
 |-------|-----------|--------|
 | bonding_curve | Create instruction accounts[2] | PDA seeds ["bonding-curve", mint]. |
+| associated_bonding_curve | Create accounts[3] | Token account for bonding curve. |
 | global | Create accounts[4] | PDA seeds ["global"]. |
 | fee_recipient | Same-tx Buy accounts[1], or client reads Global | Not a PDA; from Global account or Buy ix. |
 | metadata | Create accounts[6] | Metaplex metadata PDA for mint. |
-| creator_vault | Not filled by pipeline | PDA seeds ["creator-vault", creator]. |
-| fee_config | Not filled | PDA seeds ["fee_config", pump_fun_program_id] on fee program. |
+| creator_vault | Derived by pipeline | PDA seeds ["creator-vault", creator]. |
+| fee_config | Derived by pipeline | PDA seeds ["fee_config", pump_fun_program_id] on fee program. |
 
 See [pumpfun_accounts.md](pumpfun_accounts.md) for derivation.
 

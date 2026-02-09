@@ -50,11 +50,12 @@ So we use accounts[1] as fee_recipient when enriching a launch from a same-tx Bu
 
 ## What the pipeline sends on token_launch
 
-- **bonding_curve, global, metadata:** From Create instruction accounts.
+- **bonding_curve, associated_bonding_curve, global, metadata:** From Create instruction accounts.
+- **creator_vault, fee_config:** Derived and filled by the pipeline (so frontend does not need to).
 - **fee_recipient:** From same-tx Buy instruction (accounts[1]) when present; otherwise null — client fetches Global or skips.
-- **creator_vault, fee_config:** Not filled by the pipeline; derive with seeds above if needed.
 
 Use token_launch + trade data to build Create/Buy/Sell without extra RPC when possible. After migration, use mint + pool from migration/trade and AMM program for Buy/Sell.
+
 
 ---
 

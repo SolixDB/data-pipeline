@@ -139,7 +139,7 @@ async fn handle_transaction(
             initial_bonding_curve_state: launch.initial_bonding_curve_state,
             pump_constants: launch.pump_constants,
         };
-        if let Ok(bytes) = rmp_serde::to_vec(&ServerMessage::TokenLaunch(payload)) {
+        if let Ok(bytes) = rmp_serde::to_vec_named(&ServerMessage::TokenLaunch(payload)) {
             ws_server.broadcast(bytes);
         }
         debug!("{} | clients={}", log_msg, ws_server.client_count());
@@ -163,7 +163,7 @@ async fn handle_transaction(
             create_marker
         );
         trade.sent_at = unix_timestamp_micros();
-        if let Ok(bytes) = rmp_serde::to_vec(&ServerMessage::Trade(trade.clone())) {
+        if let Ok(bytes) = rmp_serde::to_vec_named(&ServerMessage::Trade(trade.clone())) {
             ws_server.broadcast(bytes);
         }
         storage_tx.send(StorageMessage::Trade(trade)).await
@@ -181,7 +181,7 @@ async fn handle_transaction(
             &migration.pool[..migration.pool.len().min(8)]
         );
         migration.sent_at = unix_timestamp_micros();
-        if let Ok(bytes) = rmp_serde::to_vec(&ServerMessage::Migration(migration.clone())) {
+        if let Ok(bytes) = rmp_serde::to_vec_named(&ServerMessage::Migration(migration.clone())) {
             ws_server.broadcast(bytes);
         }
         storage_tx.send(StorageMessage::Migration(migration)).await
