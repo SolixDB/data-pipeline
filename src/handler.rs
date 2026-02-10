@@ -214,6 +214,21 @@ async fn handle_transaction(
     }
     // #endregion
 
+    // Deduplicate at transaction level: if we already processed this tx in the last minute, skip the whole tx.
+    let now = unix_timestamp_micros();
+    if let Some(ref t) = tx_update.transaction {
+        if !t.signature.is_empty() {
+            let sig_str = bs58::encode(&t.signature).into_string();
+            let mut cache = recent_sigs.write().await;
+            cache.retain(|_, ts| now.saturating_sub(*ts) <= SIG_CACHE_TTL_MICROS);
+            if cache.get(&sig_str).is_some() {
+                debug!("Skip duplicate tx: sig={}..", sig_str.chars().take(16).collect::<String>());
+                return Ok(());
+            }
+            cache.insert(sig_str, now);
+        }
+    }
+
     let instructions = InstructionUpdate::parse_from_txn(tx_update)
         .map_err(|e| anyhow::anyhow!("parse_from_txn: {:?}", e))?;
     let received_at = unix_timestamp_micros();
@@ -348,28 +363,6 @@ async fn handle_transaction(
     }
 
     for mut trade in trades {
-        // Deduplicate trades by signature over a short time window to avoid double-counted volume.
-        {
-            let now = received_at;
-            let mut sigs = recent_sigs.write().await;
-            // Drop signatures older than the TTL to keep the cache bounded.
-            sigs.retain(|_, ts| now.saturating_sub(*ts) <= SIG_CACHE_TTL_MICROS);
-            if let Some(prev) = sigs.get(&trade.signature) {
-                debug_log(
-                    "handler.rs:dedupe_trade",
-                    "skip_duplicate_trade",
-                    serde_json::json!({
-                        "mint": trade.mint.as_str().get(..16).unwrap_or(&trade.mint),
-                        "sig": trade.signature.as_str().get(..16).unwrap_or(&trade.signature),
-                        "prev_ts": prev,
-                        "now": now
-                    }),
-                    "H3",
-                );
-                continue;
-            }
-            sigs.insert(trade.signature.clone(), now);
-        }
         let mut migration_event: Option<Migration> = None;
         if !known_mints.read().await.contains(&trade.mint) {
              continue;
@@ -416,7 +409,8 @@ async fn handle_transaction(
                 );
             }
             // #endregion
-            finalized_candle = token_state.add_trade(received_at, sol_amount, trade.price);
+            let trade_ts_micros = trade.txn_timestamp.saturating_mul(1000);
+            finalized_candle = token_state.add_trade(trade_ts_micros, sol_amount, trade.price);
             // #region agent log
             let vol_after = token_state.volume_metrics.volume_24h;
             if vol_after > 1e9_f64 || sol_amount > 1e9_f64 {

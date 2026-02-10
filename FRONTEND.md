@@ -157,6 +157,8 @@ Key fields:
 - `total_fees_sol`
 - `is_bonding_curve`, `pool?`
 
+**Volume semantics:** All volume fields are in **SOL** (not lamports). They are rolling windows from **on-chain trade time** (5m, 1h, 6h, 24h). The pipeline deduplicates by transaction (same tx is never counted twice). Use `volume_sol` or `volume_24h` for “total volume” display; both are the 24h window.
+
 Use this to:
 
 - Stream the trade feed.
