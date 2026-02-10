@@ -72,71 +72,144 @@ fn read_length_prefixed_string(data: &[u8], offset: &mut usize) -> Option<String
     Some(s)
 }
 
+/// Parse createEvent from "Program data:" log (IDL: name, symbol, uri, mint, bondingCurve, user, creator, timestamp, ...).
+/// Used as fallback for CreateV2 when instruction data is missing or wrong.
+fn try_parse_create_event_from_logs(ix: &InstructionUpdate) -> Option<(String, String, String, String, String, String)> {
+    use base64::Engine;
+    let decoder = base64::engine::general_purpose::STANDARD;
+    for log in &ix.shared.log_messages {
+        let data_str = log.strip_prefix("Program data: ")?;
+        let data = decoder.decode(data_str.trim()).ok()?;
+        if data.len() < 8 + 4 * 3 + 32 * 4 {
+            continue;
+        }
+        let mut offset = 8;
+        let name = read_length_prefixed_string(&data, &mut offset)?;
+        let symbol = read_length_prefixed_string(&data, &mut offset)?;
+        let uri = read_length_prefixed_string(&data, &mut offset)?;
+        if offset + 32 * 4 > data.len() {
+            continue;
+        }
+        let mint = bs58::encode(&data[offset..offset + 32]).into_string();
+        let bonding_curve = bs58::encode(&data[offset + 32..offset + 64]).into_string();
+        let _user = bs58::encode(&data[offset + 64..offset + 96]).into_string();
+        let creator = bs58::encode(&data[offset + 96..offset + 128]).into_string();
+        if mint.is_empty() || bonding_curve.is_empty() {
+            continue;
+        }
+        return Some((name, symbol, uri, mint, bonding_curve, creator));
+    }
+    None
+}
+
 pub fn parse_create(ix: &InstructionUpdate, received_at: u64) -> Option<crate::events::TokenLaunch> {
     if !has_create_in_logs(ix) {
         return None;
     }
-    
-    // Detect if this is CreateV2 (Token 2022)
-    let is_token_2022 = has_create_v2_in_logs(ix);
-    
-    let data = &ix.data;
-    if data.len() < 8 {
-        return None;
-    }
-    let mut offset = 8;
-    let name = read_length_prefixed_string(data, &mut offset)?;
-    let symbol = read_length_prefixed_string(data, &mut offset)?;
-    let uri = read_length_prefixed_string(data, &mut offset)?;
-    if offset + 32 > data.len() {
-        return None;
-    }
-    let creator = bs58::encode(&data[offset..offset + 32]).into_string();
-    let mint = ix
-        .accounts
-        .get(0)
-        .map(|p| bs58::encode(&p.0).into_string())
-        .unwrap_or_default();
-    let bonding_curve = ix.accounts.get(2).map(|p| bs58::encode(&p.0).into_string());
-    let associated_bonding_curve = ix.accounts.get(3).map(|p| bs58::encode(&p.0).into_string());
-    let global = ix.accounts.get(4).map(|p| bs58::encode(&p.0).into_string());
 
-    let metadata_program_id = Pubkey::from_str("metaqbxxUerdq28cj1RbAWkYQm3ybzjb6a8bt518x1s").unwrap_or_default();
-    let mint_pubkey = Pubkey::from_str(&mint).unwrap_or_default();
-    let (metadata_pda, _) = Pubkey::find_program_address(
-        &[
-            b"metadata",
-            metadata_program_id.as_ref(),
-            mint_pubkey.as_ref(),
-        ],
-        &metadata_program_id,
-    );
-    let metadata = Some(metadata_pda.to_string());
+    let is_token_2022 = has_create_v2_in_logs(ix);
     let signature = bs58::encode(ix.shared.signature.as_slice()).into_string();
     let txn_timestamp = txn_timestamp_from_create_logs(ix).unwrap_or(received_at / 1000);
 
+    let data = &ix.data;
+    if data.len() >= 8 {
+        let mut offset = 8;
+        if let (Some(n), Some(s), Some(u)) = (
+            read_length_prefixed_string(data, &mut offset),
+            read_length_prefixed_string(data, &mut offset),
+            read_length_prefixed_string(data, &mut offset),
+        ) {
+            if offset + 32 <= data.len() {
+                let c = bs58::encode(&data[offset..offset + 32]).into_string();
+                let m = ix.accounts.get(0).map(|p| bs58::encode(&p.0).into_string()).unwrap_or_default();
+                let bc = ix.accounts.get(2).map(|p| bs58::encode(&p.0).into_string());
+                let abc = ix.accounts.get(3).map(|p| bs58::encode(&p.0).into_string());
+                let g = ix.accounts.get(4).map(|p| bs58::encode(&p.0).into_string());
+                if !m.is_empty() || !n.is_empty() || !s.is_empty() || !u.is_empty() {
+                    return build_token_launch(
+                        ix,
+                        &signature,
+                        txn_timestamp,
+                        received_at,
+                        is_token_2022,
+                        n,
+                        s,
+                        u,
+                        m,
+                        c,
+                        bc,
+                        abc,
+                        g,
+                    );
+                }
+            }
+        }
+    }
+
+    if is_token_2022 {
+        if let Some((n, s, u, m, bc, c)) = try_parse_create_event_from_logs(ix) {
+            let abc = ix.accounts.get(3).map(|p| bs58::encode(&p.0).into_string());
+            let g = ix.accounts.get(4).map(|p| bs58::encode(&p.0).into_string());
+            return build_token_launch(
+                ix,
+                &signature,
+                txn_timestamp,
+                received_at,
+                true,
+                n,
+                s,
+                u,
+                m,
+                c,
+                Some(bc),
+                abc,
+                g,
+            );
+        }
+    }
+
+    None
+}
+
+fn build_token_launch(
+    ix: &InstructionUpdate,
+    signature: &str,
+    txn_timestamp: u64,
+    received_at: u64,
+    is_token_2022: bool,
+    name: String,
+    symbol: String,
+    uri: String,
+    mint: String,
+    creator: String,
+    bonding_curve: Option<String>,
+    associated_bonding_curve: Option<String>,
+    global: Option<String>,
+) -> Option<crate::events::TokenLaunch> {
+    let metadata_program_id = Pubkey::from_str("metaqbxxUerdq28cj1RbAWkYQm3ybzjb6a8bt518x1s").unwrap_or_default();
+    let mint_pubkey = Pubkey::from_str(&mint).unwrap_or_default();
+    let (metadata_pda, _) = Pubkey::find_program_address(
+        &[b"metadata", metadata_program_id.as_ref(), mint_pubkey.as_ref()],
+        &metadata_program_id,
+    );
+    let metadata = Some(metadata_pda.to_string());
+
     let pump_program = Pubkey::from_str(PUMP_FUN_PROGRAM_ID).unwrap_or_default();
     let fee_program = Pubkey::from_str(PUMP_FUN_FEE_PROGRAM_ID).unwrap_or_default();
-
-    // creator_vault: ["creator-vault", creator_pubkey]
-    let creator_bytes = &data[offset..offset + 32];
+    let creator_bytes = bs58::decode(&creator).into_vec().ok();
+    let creator_slice: &[u8] = match creator_bytes.as_deref() {
+        Some(b) if b.len() >= 32 => &b[..32],
+        _ => return None,
+    };
     let (creator_vault_pda, _) = Pubkey::find_program_address(
-        &[b"creator-vault", creator_bytes],
+        &[b"creator-vault", creator_slice],
         &pump_program,
     );
-
-    // fee_config: ["fee_config", pump_fun_program_id] - program: fee_program
-    // Note: docs say seeds are ["fee_config", pump_fun_program_id]
     let (fee_config_pda, _) = Pubkey::find_program_address(
         &[b"fee_config", pump_program.as_ref()],
         &fee_program,
     );
-
-    // event_authority: ["__event_authority"] - program: pump_program
-    let (event_authority_pda, _) = Pubkey::find_program_address(
-        &[b"__event_authority"],
-        &pump_program,
-    );
+    let (event_authority_pda, _) = Pubkey::find_program_address(&[b"__event_authority"], &pump_program);
 
     let pump_accounts = crate::events::PumpFunBondingCurveAccounts {
         bonding_curve,
@@ -148,16 +221,9 @@ pub fn parse_create(ix: &InstructionUpdate, received_at: u64) -> Option<crate::e
         fee_config: Some(fee_config_pda.to_string()),
         event_authority: Some(event_authority_pda.to_string()),
     };
-    
-    if is_token_2022 {
-        tracing::info!(
-            "Detected CreateV2 (Token 2022) launch: mint={}, name={}, symbol={}, signature={}", 
-            mint, name, symbol, signature
-        );
-    }
-    
+
     Some(crate::events::TokenLaunch {
-        signature,
+        signature: signature.to_string(),
         slot: ix.shared.slot,
         mint,
         name,
