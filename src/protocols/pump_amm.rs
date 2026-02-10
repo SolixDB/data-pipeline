@@ -12,7 +12,9 @@ const SELL_POOL_BASE_OFF: usize = 40;
 const SELL_POOL_QUOTE_OFF: usize = 48;
 
 pub fn has_buy_in_logs(ix: &InstructionUpdate) -> bool {
-    ix.shared.log_messages.iter().any(|l| l.contains("Instruction: Buy"))
+    ix.shared.log_messages.iter().any(|l| {
+        l.contains("Instruction: Buy") || l.contains("Instruction: BuyExactQuoteIn")
+    })
 }
 
 pub fn has_sell_in_logs(ix: &InstructionUpdate) -> bool {

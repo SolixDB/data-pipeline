@@ -18,6 +18,28 @@ use yellowstone_grpc_proto::prelude::{
 };
 use yellowstone_vixen_core::instruction::InstructionUpdate;
 
+// #region agent log
+const DEBUG_LOG: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/.cursor/debug.log");
+const SIG_CACHE_TTL_MICROS: u64 = 60_000_000; // 60 seconds
+fn debug_log(location: &str, message: &str, data: serde_json::Value, hypothesis_id: &str) {
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    let line = serde_json::json!({
+        "timestamp": ts,
+        "location": location,
+        "message": message,
+        "data": data,
+        "hypothesisId": hypothesis_id
+    });
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(DEBUG_LOG) {
+        use std::io::Write;
+        let _ = writeln!(f, "{}", line);
+    }
+}
+// #endregion
+
 pub async fn handle_stream_updates(
     mut stream: impl futures::Stream<Item = Result<yellowstone_grpc_proto::prelude::SubscribeUpdate, tonic::Status>>
         + Unpin,
@@ -38,6 +60,7 @@ pub async fn handle_stream_updates(
     let trade_count = Arc::new(AtomicU64::new(0));
     let migration_count = Arc::new(AtomicU64::new(0));
     let known_mints = Arc::new(RwLock::new(HashSet::<String>::new()));
+    let recent_sigs = Arc::new(RwLock::new(HashMap::<String, u64>::new()));
 
     if let Some(state_lock) = &snapshot_state {
         let state = state_lock.read().await;
@@ -112,6 +135,7 @@ pub async fn handle_stream_updates(
                                     known_mints.clone(),
                                     redis_client.clone(),
                                     rpc_url.as_deref(),
+                                    recent_sigs.clone(),
                                 )
                                 .await
                                 {
@@ -163,16 +187,32 @@ async fn handle_transaction(
     known_mints: Arc<RwLock<HashSet<String>>>,
     redis_client: Option<Arc<redis::Client>>,
     rpc_url: Option<&str>,
+    recent_sigs: Arc<RwLock<HashMap<String, u64>>>,
 ) -> anyhow::Result<()> {
     if let Some(h) = health_state {
         h.record_activity();
     }
 
+    // #region agent log
     if let Some(meta) = &tx_update.transaction.as_ref().and_then(|t| t.meta.as_ref()) {
         if meta.err.is_some() {
+            debug_log(
+                "handler.rs:skip_failed",
+                "skip_failed_tx",
+                serde_json::json!({"err": true}),
+                "H1",
+            );
             return Ok(());
         }
+    } else {
+        debug_log(
+            "handler.rs:no_meta",
+            "process_no_meta",
+            serde_json::json!({"has_tx": tx_update.transaction.is_some()}),
+            "H1",
+        );
     }
+    // #endregion
 
     let instructions = InstructionUpdate::parse_from_txn(tx_update)
         .map_err(|e| anyhow::anyhow!("parse_from_txn: {:?}", e))?;
@@ -308,6 +348,28 @@ async fn handle_transaction(
     }
 
     for mut trade in trades {
+        // Deduplicate trades by signature over a short time window to avoid double-counted volume.
+        {
+            let now = received_at;
+            let mut sigs = recent_sigs.write().await;
+            // Drop signatures older than the TTL to keep the cache bounded.
+            sigs.retain(|_, ts| now.saturating_sub(*ts) <= SIG_CACHE_TTL_MICROS);
+            if let Some(prev) = sigs.get(&trade.signature) {
+                debug_log(
+                    "handler.rs:dedupe_trade",
+                    "skip_duplicate_trade",
+                    serde_json::json!({
+                        "mint": trade.mint.as_str().get(..16).unwrap_or(&trade.mint),
+                        "sig": trade.signature.as_str().get(..16).unwrap_or(&trade.signature),
+                        "prev_ts": prev,
+                        "now": now
+                    }),
+                    "H3",
+                );
+                continue;
+            }
+            sigs.insert(trade.signature.clone(), now);
+        }
         let mut migration_event: Option<Migration> = None;
         if !known_mints.read().await.contains(&trade.mint) {
              continue;
@@ -336,7 +398,41 @@ async fn handle_transaction(
             token_state.last_slot = trade.slot;
 
             let sol_amount = trade.sol_amount as f64 / 1_000_000_000.0;
+            // #region agent log
+            let vol_before = token_state.volume_metrics.volume_24h;
+            if vol_before > 1e6_f64 || sol_amount > 50.0 || trade.sol_amount > 50_000_000_000 {
+                debug_log(
+                    "handler.rs:add_trade_before",
+                    "add_trade",
+                    serde_json::json!({
+                        "mint": trade.mint.as_str().get(..16).unwrap_or(&trade.mint),
+                        "sig": trade.signature.as_str().get(..16).unwrap_or(&trade.signature),
+                        "sol_amount_lamports": trade.sol_amount,
+                        "sol_amount_sol": sol_amount,
+                        "volume_24h_before": vol_before,
+                        "trade_history_len": token_state.trade_history.len()
+                    }),
+                    "H2_H3_H5",
+                );
+            }
+            // #endregion
             finalized_candle = token_state.add_trade(received_at, sol_amount, trade.price);
+            // #region agent log
+            let vol_after = token_state.volume_metrics.volume_24h;
+            if vol_after > 1e9_f64 || sol_amount > 1e9_f64 {
+                debug_log(
+                    "handler.rs:add_trade_after",
+                    "suspicious_volume",
+                    serde_json::json!({
+                        "mint": trade.mint.as_str().get(..20).unwrap_or(&trade.mint),
+                        "volume_24h_after": vol_after,
+                        "sol_amount_sol": sol_amount,
+                        "sol_amount_lamports": trade.sol_amount
+                    }),
+                    "H2",
+                );
+            }
+            // #endregion
 
             if sol_amount > 100.0 {
                  info!("signal: VOLUME_SPIKE | mint={} | amount={} SOL", trade.mint, sol_amount);
@@ -448,6 +544,20 @@ async fn handle_transaction(
             create_marker
         );
         trade.sent_at = unix_timestamp_micros();
+        // #region agent log
+        if trade.volume_sol > 1e9_f64 {
+            debug_log(
+                "handler.rs:send_trade",
+                "send_volume_sol",
+                serde_json::json!({
+                    "mint": trade.mint.as_str().get(..20).unwrap_or(&trade.mint),
+                    "volume_sol": trade.volume_sol,
+                    "volume_24h": trade.volume_sol
+                }),
+                "H4",
+            );
+        }
+        // #endregion
         if let Ok(bytes) = rmp_serde::to_vec_named(&ServerMessage::Trade(trade.clone())) {
             ws_server.broadcast(trade.mint.clone(), bytes);
         }

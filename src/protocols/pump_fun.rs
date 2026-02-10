@@ -12,17 +12,25 @@ pub const PUMP_FUN_FEE_PROGRAM_ID: &str = "pfeeUxB6jkeY1Hxd7CsFCAjcbHA9rWtchMGdZ
 
 pub fn has_create_in_logs(ix: &InstructionUpdate) -> bool {
     ix.shared.log_messages.iter().any(|l| {
-        l.contains("Instruction: Create")
+        (l.contains("Instruction: Create") || l.contains("Instruction: CreateV2"))
             && !l.contains("CreateToken")
             && !l.contains("CreateIdempotent")
     })
+}
+
+pub fn has_create_v2_in_logs(ix: &InstructionUpdate) -> bool {
+    ix.shared.log_messages.iter().any(|l| l.contains("Instruction: CreateV2"))
 }
 
 pub fn has_trade_in_logs(ix: &InstructionUpdate) -> bool {
     ix.shared
         .log_messages
         .iter()
-        .any(|l| l.contains("Instruction: Buy") || l.contains("Instruction: Sell"))
+        .any(|l| {
+            l.contains("Instruction: Buy") 
+            || l.contains("Instruction: Sell")
+            || l.contains("Instruction: BuyExactSolIn")
+        })
 }
 
 pub fn has_migrate_in_logs(ix: &InstructionUpdate) -> bool {
@@ -68,6 +76,10 @@ pub fn parse_create(ix: &InstructionUpdate, received_at: u64) -> Option<crate::e
     if !has_create_in_logs(ix) {
         return None;
     }
+    
+    // Detect if this is CreateV2 (Token 2022)
+    let is_token_2022 = has_create_v2_in_logs(ix);
+    
     let data = &ix.data;
     if data.len() < 8 {
         return None;
@@ -136,6 +148,14 @@ pub fn parse_create(ix: &InstructionUpdate, received_at: u64) -> Option<crate::e
         fee_config: Some(fee_config_pda.to_string()),
         event_authority: Some(event_authority_pda.to_string()),
     };
+    
+    if is_token_2022 {
+        tracing::info!(
+            "Detected CreateV2 (Token 2022) launch: mint={}, name={}, symbol={}, signature={}", 
+            mint, name, symbol, signature
+        );
+    }
+    
     Some(crate::events::TokenLaunch {
         signature,
         slot: ix.shared.slot,
@@ -149,6 +169,7 @@ pub fn parse_create(ix: &InstructionUpdate, received_at: u64) -> Option<crate::e
         initial_bonding_curve_state: None,
         pump_constants: crate::events::PumpProtocolConstants::default(),
         security: None,
+        is_token_2022,
         txn_timestamp,
         received_at,
         sent_at: 0,

@@ -82,6 +82,8 @@ pub struct TokenLaunch {
     pub pump_constants: PumpProtocolConstants,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub security: Option<crate::security::MintSecurity>,
+    #[serde(default)]
+    pub is_token_2022: bool,
     pub txn_timestamp: u64,
     pub received_at: u64,
     pub sent_at: u64,
