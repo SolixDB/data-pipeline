@@ -2,31 +2,33 @@
 
 **Source:** `src/messages.rs`
 
-Types sent over the WebSocket: ServerMessage and its payloads. All frames are MessagePack-encoded. This doc describes when each message is sent and every payload field. Event types are in [events.md](events.md); PDA/account semantics in [pumpfun_accounts.md](pumpfun_accounts.md).
+Types sent over the WebSocket are `ServerMessage` values encoded as MessagePack. This doc is the contract for WebSocket consumers.
 
 ---
 
 ## Encoding
 
-- **Format:** MessagePack (binary). Serialization: `rmp_serde::to_vec(&ServerMessage::...)`.
-- **Shape:** Serde tag `type` (variant name) and content `data` (payload). Variants are snake_case: `connected`, `token_launch`, `trade`, `migration`.
-- **Per frame:** One ServerMessage per WebSocket binary frame. No batching.
+- **Format:** MessagePack (binary), via `rmp_serde::to_vec_named(&ServerMessage::...)`.
+- **Shape:** Serde tag `type` (snake_case variant) and content `data` (payload).
+- **Per frame:** Exactly one `ServerMessage` per binary frame.
 
 ---
 
-## ServerMessage enum
+## ServerMessage variants
 
-- **Connected(ConnectedPayload)** — sent once per connection right after handshake.
-- **TokenLaunch(TokenLaunchPayload)** — one per Pump.fun Create observed (live stream).
-- **Trade(Trade)** — one per Buy/Sell (bonding curve or AMM). Trade is the same struct as in events (live stream).
-- **Migration(Migration)** — one per Migrate observed (live stream).
-- **SnapshotMigrated(Vec<MigratedEntry>)** — sent once on connect. Full list of migrated tokens.
-- **SnapshotSoonMigrating(Vec<SoonMigratingEntry>)** — sent once on connect. Tokens nearing migration.
-- **SnapshotLaunches(Vec<TokenLaunchPayload>)** — sent once on connect. Last 50 token launches (same shape as TokenLaunch).
-- **SnapshotTrades(Vec<Trade>)** — sent once on connect. Trades for the mints in the last 50 launches (same shape as Trade).
-- **SnapshotTickers(Vec<TokenState>)** — sent once on connect. Current state (price, volume, market cap) for all active tokens. This is the **primary source of truth** for initial state.
+- `connected` → `Connected(ConnectedPayload)`
+- `token_launch` → `TokenLaunch(TokenLaunchPayload)`
+- `token_security_update` → `TokenSecurityUpdate(TokenSecurityUpdate)`
+- `trade` → `Trade(crate::events::Trade)`
+- `migration` → `Migration(crate::events::Migration)`
+- `ohclv` → `Ohclv(crate::events::Ohclv)`
+- `snapshot_migrated` → `SnapshotMigrated(Vec<crate::storage::MigratedEntry>)`
+- `snapshot_soon_migrating` → `SnapshotSoonMigrating(Vec<crate::storage::SoonMigratingEntry>)`
+- `snapshot_launches` → `SnapshotLaunches(Vec<TokenLaunchPayload>)`
+- `snapshot_trades` → `SnapshotTrades(Vec<crate::events::Trade>)`
+- `snapshot_tickers` → `SnapshotTickers(Vec<TokenTicker>)`
 
-Snapshots are sent from in-memory state (hydrated from Redis on startup). Client must handle all variants. Snapshot variants use the same payload types as live messages.
+Snapshots are sent once on connect; live variants stream until the connection closes.
 
 ---
 
@@ -42,7 +44,7 @@ Sent by ws_server in handle_connection immediately after accept. See [ws_server.
 
 ## TokenLaunchPayload
 
-Same information as events::TokenLaunch; handler maps field-by-field. Used so the wire type can evolve independently if needed.
+Same information as `events::TokenLaunch`, with an optional embedded Rug Check result.
 
 | Field | Type | Meaning |
 |-------|------|--------|
@@ -55,8 +57,30 @@ Same information as events::TokenLaunch; handler maps field-by-field. Used so th
 | token_decimals | u8 | 6. |
 | initial_bonding_curve_state | Option<BondingCurveState> | From same-tx trade when available. |
 | pump_constants | PumpProtocolConstants | program_ids and token_decimals. |
+| security | Option<MintSecurity> | Rug Check mint security; usually null on the first `token_launch`. |
 
-Clients use this to display the new token and build Create/Buy/Sell without extra RPC when possible. fee_recipient may be null; then fetch Global account at pump_accounts.global or derive per [pumpfun_accounts.md](pumpfun_accounts.md).
+Notes:
+
+- On the initial `token_launch` the `security` field is typically `null`; Rug Check runs in a background task.
+- On later snapshots (`snapshot_launches`) and for stored launches, `security` is populated when Rug Check succeeded.
+
+See [events.md](events.md) for `MintSecurity`.
+
+---
+
+## TokenSecurityUpdate
+
+Follow-up message when Rug Check completes for a mint.
+
+| Field | Type | Meaning |
+|-------|------|--------|
+| mint | String | Mint this update applies to. |
+| security | MintSecurity | Parsed SPL mint security. |
+
+Behaviour:
+
+- Emitted once per mint when background Rug Check succeeds.
+- Broadcast on topic = mint, so subscribers to that mint see the update without reconnecting.
 
 ---
 
@@ -78,9 +102,18 @@ Same struct as events::Migration. Fields: signature, slot, mint, user, bonding_c
 
 **SoonMigratingEntry** (storage): `mint`, `progress_pct` (f64), `virtual_token_reserves` (u64).
 
-**SnapshotLaunches** and **SnapshotTrades** use the same payload types as live `TokenLaunch` and `Trade`; treat them the same in the UI (e.g. push into the same lists).
+**SnapshotLaunches** and **SnapshotTrades** use the same payload types as live `token_launch` and `trade`.
 
-**TokenState** (SnapshotTickers): `mint`, `price`, `market_cap`, `liquidity_sol`, `volume_5m`, `volume_1h`, `volume_6h`, `volume_24h`, `tx_count_5m`, `tx_count_1h`, `tx_count_6h`, `tx_count_24h`, `total_fees_sol`, `last_slot`. Note: `trade_history` and `last_cleanup_micros` are internal fields not sent to clients.
+**TokenTicker** (SnapshotTickers) flattens `storage::TokenState` for the wire:
+
+- `mint`
+- `price`, `market_cap`, `liquidity_sol`
+- `volume_5m`, `volume_1h`, `volume_6h`, `volume_24h`
+- `tx_count_5m`, `tx_count_1h`, `tx_count_6h`, `tx_count_24h`
+- `price_change_5m`, `price_change_1h`, `price_change_6h`, `price_change_24h`
+- `total_fees_sol`
+- `last_slot`
+- `migrated_to_pool: Option<String>`
 
 ---
 
@@ -92,7 +125,7 @@ Same struct as events::Migration. Fields: signature, slot, mint, user, bonding_c
 4. **snapshot_launches** — Once. Last 50 launches; replace or init launch feed.
 5. **snapshot_trades** — Once. Trades for those mints; replace or init trade feed.
 6. **snapshot_tickers** — Once. Current state of all active tokens. **Use this to initially populate the UI to prevent blank screens.**
-7. **token_launch** / **trade** / **migration** — Live stream from then on. Append to the same lists.
+7. Live stream: `token_launch`, `token_security_update`, `trade`, `migration`, `ohclv`.
 
 Snapshots are hydrated from Redis on startup. Redis persistence ensures consistent state (volume, price) across server restarts.
 

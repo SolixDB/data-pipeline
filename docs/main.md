@@ -12,11 +12,11 @@ This document walks through the binary from startup to shutdown. No external ref
 2. Load and validate config (env); exit if invalid.
 3. Build in-memory snapshot state (Arc<RwLock<SnapshotState>>); optional Redis client from REDIS_URL.
 4. Start WebSocket server (listener task) on `WS_PORT` with snapshot state and optional Redis client.
-5. If HEALTH_PORT is not 0, create HealthState and spawn health HTTP server (GET /health → 200 if last gRPC activity within HEALTH_GRPC_MAX_AGE_SECS).
+5. Create `HealthState` and spawn the combined HTTP API + health server (`api::ApiServer::start`) on `HEALTH_PORT`.
 6. Build optional ClickHouse client (unless SKIP_CLICKHOUSE); ensure pipeline_metrics and storage tables; if CLEAR_CLICKHOUSE or CLEAR_CLICKHOUSE_ONLY, drop and recreate tables; if CLEAR_CLICKHOUSE_ONLY set metrics_client to None for the rest of the run.
 7. Spawn storage worker (channel receiver, ClickHouse client, redis_url, snapshot state, config.snapshot_launch_limit, config.snapshot_trade_limit).
 8. Set up shutdown (Ctrl+C) and gRPC retry backoff.
-9. Retry loop: connect gRPC, call health_state.record_activity(), subscribe to transactions (Pump.fun + Pump AMM), run `handle_stream_updates` (with storage_tx and health_state) until stream ends or shutdown. On stream error, backoff and reconnect.
+9. Retry loop: connect gRPC, call health_state.record_activity(), subscribe to transactions (Pump.fun + Pump AMM), run `handle_stream_updates` (with storage_tx, health_state, snapshot_state, Redis client, and optional RPC_URL for Rug Check) until stream ends or shutdown. On stream error, backoff and reconnect.
 10. Process exits when retry gives up or shutdown is requested.
 
 ---
@@ -48,11 +48,14 @@ This document walks through the binary from startup to shutdown. No external ref
 - Else if `config.clickhouse_url` is set: `db::make_client(url, user, password)`, then `db::ensure_table` and `ensure_token_launches_table`, `ensure_trades_table`, `ensure_migrations_table`. If `clear_clickhouse` or `clear_clickhouse_only`: `db::drop_tables` then ensure all four again. If `clear_clickhouse_only`: set `metrics_client = None` so no further writes this run.
 - `metrics_client` is cloned into the retry closure for the handler and into the storage worker.
 
-### 5. Health server (optional)
+### 5. HTTP API + health server
 
 - `health_state = Arc::new(health::HealthState::new())`.
-- `health::spawn_health_server(config.health_port, config.health_grpc_max_age_secs, health_state)` — if port is not 0, binds 0.0.0.0:port and serves GET /health: 200 if `now_secs - last_activity_secs <= max_age_secs`, else 503. Handler and main (on connect) call `record_activity()` to update last_activity_secs.
-- `health_state` is cloned into the retry closure and passed to `handle_stream_updates`.
+- `ApiServer::start(port, clickhouse.clone(), health_state.clone())` is spawned on a background task:
+  - Port comes from `HEALTH_PORT` env or defaults to 5567.
+  - Provides `/config`, `/symbols`, `/history`, `/health`, and `/`.
+  - `/history` uses ClickHouse OHLCV when configured.
+- `health_state` is cloned into the retry closure and passed to `handle_stream_updates`, so you can tighten `/health` semantics later if desired.
 
 ### 6. Storage worker
 
@@ -74,9 +77,11 @@ Each attempt:
 3. If shutdown again, return `Permanent`.
 4. `health_state.record_activity()` — so health is 200 right after connect.
 5. `multi_parser::build_parser_map()` — map program id bytes → `"pump_fun"` / `"pump_amm"`. Keys are base58-decoded program IDs; subscription needs base58 strings, so keys are encoded to strings for the request.
-6. Build `SubscribeRequest`: only `transactions` filter; `account_include` = Pump.fun and Pump AMM program IDs (from parser_map keys); `vote: false`; commitment from config (Processed). No slots/accounts/entry/blocks.
+6. Build `SubscribeRequest`: only `transactions` filter; `account_include` = Pump.fun and Pump AMM program IDs (from parser_map keys); `vote: false`; commitment from config (Processed). If a cursor is available from snapshot state, slots filter and from_slot are filled to resume with overlap.
 7. `grpc.subscribe_with_request(Some(subscribe_request)).await` — returns `(subscribe_tx, stream)`.
-8. `tokio::select!`: either `handle_stream_updates(stream, subscribe_tx, config, ws_server, parser_map, metrics_client, storage_tx, Some(health_state))` completes (then map result to transient/permanent error for retry), or `shutdown_rx.changed()` (then return permanent error).
+8. `tokio::select!`: either
+   - `handle_stream_updates(stream, subscribe_tx, config, ws_server, parser_map, metrics_client, storage_tx, Some(health_state), Some(snapshot_state), redis_client_retry, std::env::var("RPC_URL").ok())` completes (then map result to transient/permanent error for retry), or
+   - `shutdown_rx.changed()` (then return permanent error).
 
 So: one long-lived stream; when the stream errors or ends, `handle_stream_updates` returns, the error is treated as transient, and `future::retry` runs the closure again after backoff. Shutdown makes the error permanent so retry stops.
 

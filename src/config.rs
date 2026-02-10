@@ -15,22 +15,17 @@ pub struct Config {
     pub clickhouse_password: Option<String>,
     #[allow(dead_code)]
     pub redis_url: Option<String>,
-    /// When true, TRUNCATE pipeline ClickHouse tables on startup (for dev).
     pub clear_clickhouse: bool,
-    /// When true, clear Redis snapshot keys on startup (for dev).
     pub clear_redis: bool,
-    /// When true, do not connect or write to ClickHouse (Redis/WS still work).
     pub skip_clickhouse: bool,
-    /// When true, clear ClickHouse (drop + recreate tables) then do not write any data this run.
     pub clear_clickhouse_only: bool,
-    /// HTTP health server port; 0 = disabled.
+    #[allow(dead_code)]
     pub health_port: u16,
-    /// Health returns 200 only if last gRPC activity is within this many seconds.
+    #[allow(dead_code)]
     pub health_grpc_max_age_secs: u64,
-    /// Max token launches in WS connect snapshot.
     pub snapshot_launch_limit: usize,
-    /// Max trades (for those mints) in WS connect snapshot.
     pub snapshot_trade_limit: usize,
+    pub cursor_overlap_slots: u64,
 }
 
 impl Default for Config {
@@ -80,6 +75,10 @@ impl Default for Config {
                 .ok()
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(1000),
+            cursor_overlap_slots: env::var("CURSOR_OVERLAP_SLOTS")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(2),
         }
     }
 }

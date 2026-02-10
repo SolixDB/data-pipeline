@@ -1,6 +1,5 @@
 use serde::{Deserialize, Serialize};
 
-/// Token launch payload sent over WebSocket. Includes all data needed to build Create/Buy/Sell.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TokenLaunchPayload {
     pub signature: String,
@@ -10,17 +9,21 @@ pub struct TokenLaunchPayload {
     pub symbol: String,
     pub uri: String,
     pub creator: String,
-    /// Pump.fun PDAs and fee_recipient (bonding curve). See docs/pumpfun_accounts.md.
     #[serde(default)]
     pub pump_accounts: crate::events::PumpFunBondingCurveAccounts,
-    /// Token decimals (6 for Pump.fun). For amounts and tx building.
     #[serde(default)]
     pub token_decimals: u8,
-    /// Initial curve state after create (from first trade in same tx). For price/slippage.
     pub initial_bonding_curve_state: Option<crate::events::BondingCurveState>,
-    /// Program IDs and constants so frontend does not hardcode.
     #[serde(default)]
     pub pump_constants: crate::events::PumpProtocolConstants,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub security: Option<crate::security::MintSecurity>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TokenSecurityUpdate {
+    pub mint: String,
+    pub security: crate::security::MintSecurity,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -29,21 +32,55 @@ pub struct TokenLaunchPayload {
 pub enum ServerMessage {
     Connected(ConnectedPayload),
     TokenLaunch(TokenLaunchPayload),
+    TokenSecurityUpdate(TokenSecurityUpdate),
     Trade(crate::events::Trade),
     Migration(crate::events::Migration),
-    /// Snapshot of migrated tokens (mint, pool, ...). Sent once on connect (in-memory; no Redis required).
     SnapshotMigrated(Vec<crate::storage::MigratedEntry>),
-    /// Snapshot of tokens soon migrating (progress %). Sent once on connect.
     SnapshotSoonMigrating(Vec<crate::storage::SoonMigratingEntry>),
-    /// Last 50 token launches. Sent once on connect.
     SnapshotLaunches(Vec<TokenLaunchPayload>),
-    /// Trades for the mints in the last 50 launches. Sent once on connect.
     SnapshotTrades(Vec<crate::events::Trade>),
-    /// Current state of all active tokens (Volume, Price, etc.). Sent once on connect.
-    SnapshotTickers(Vec<crate::storage::TokenState>),
+    SnapshotTickers(Vec<TokenTicker>),
+    Ohclv(crate::events::Ohclv),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TokenTicker {
+    pub mint: String,
+    pub price: f64,
+    pub market_cap: f64,
+    pub liquidity_sol: f64,
+    #[serde(flatten)]
+    pub volume_metrics: crate::storage::VolumeMetrics,
+    #[serde(default)]
+    pub total_fees_sol: f64,
+    pub last_slot: u64,
+    pub migrated_to_pool: Option<String>,
+}
+
+impl From<&crate::storage::TokenState> for TokenTicker {
+    fn from(s: &crate::storage::TokenState) -> Self {
+        Self {
+            mint: s.mint.clone(),
+            price: s.price,
+            market_cap: s.market_cap,
+            liquidity_sol: s.liquidity_sol,
+            volume_metrics: s.volume_metrics.clone(),
+            total_fees_sol: s.total_fees_sol,
+            last_slot: s.last_slot,
+            migrated_to_pool: s.migrated_to_pool.clone(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConnectedPayload {
     pub client_id: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "method", content = "params")]
+#[serde(rename_all = "snake_case")]
+pub enum ClientMessage {
+    Subscribe(Vec<String>),
+    Unsubscribe(Vec<String>),
 }

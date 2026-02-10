@@ -43,7 +43,6 @@ pub async fn ensure_table(client: &Client) -> clickhouse::error::Result<()> {
         "#
     );
     client.query(&ddl).execute().await?;
-    debug!("ClickHouse table {} ensured", TABLE);
     Ok(())
 }
 
@@ -194,6 +193,94 @@ pub struct MigrationRow {
     pub sent_at: u64,
 }
 
+const TABLE_OHLCV_1M: &str = "ohlcv_1m";
+
+#[derive(Debug, Row, Serialize, Deserialize)]
+pub struct OhclvRow {
+    pub mint: String,
+    pub open: f64,
+    pub high: f64,
+    pub low: f64,
+    pub close: f64,
+    pub volume: f64,
+    pub start_time: u64,
+    pub duration: u64,
+    pub received_at: u64,
+}
+
+const TABLE_VOLUME_AGGREGATES: &str = "volume_aggregates";
+
+#[derive(Debug, Row, Serialize, Deserialize)]
+pub struct VolumeAggregateRow {
+    pub mint: String,
+    pub volume_5m: f64,
+    pub volume_1h: f64,
+    pub volume_6h: f64,
+    pub volume_24h: f64,
+    pub tx_count_5m: u64,
+    pub tx_count_1h: u64,
+    pub tx_count_6h: u64,
+    pub tx_count_24h: u64,
+    pub price_change_5m: f64,
+    pub price_change_1h: f64,
+    pub price_change_6h: f64,
+    pub price_change_24h: f64,
+    pub ts: u64,
+}
+
+pub async fn ensure_volume_aggregates_table(client: &Client) -> clickhouse::error::Result<()> {
+    let ddl = format!(
+        r#"
+        CREATE TABLE IF NOT EXISTS {TABLE_VOLUME_AGGREGATES} (
+            mint LowCardinality(String),
+            volume_5m Float64 CODEC(Delta, ZSTD(3)),
+            volume_1h Float64 CODEC(Delta, ZSTD(3)),
+            volume_6h Float64 CODEC(Delta, ZSTD(3)),
+            volume_24h Float64 CODEC(Delta, ZSTD(3)),
+            tx_count_5m UInt64 CODEC(Delta, ZSTD(3)),
+            tx_count_1h UInt64 CODEC(Delta, ZSTD(3)),
+            tx_count_6h UInt64 CODEC(Delta, ZSTD(3)),
+            tx_count_24h UInt64 CODEC(Delta, ZSTD(3)),
+            price_change_5m Float64 CODEC(Delta, ZSTD(3)),
+            price_change_1h Float64 CODEC(Delta, ZSTD(3)),
+            price_change_6h Float64 CODEC(Delta, ZSTD(3)),
+            price_change_24h Float64 CODEC(Delta, ZSTD(3)),
+            ts UInt64 CODEC(Delta, ZSTD(3))
+        )
+        ENGINE = ReplacingMergeTree(ts)
+        PARTITION BY toYYYYMM(toDateTime(ts / 1000000))
+        ORDER BY (mint, ts)
+        "#
+    );
+    client.query(&ddl).execute().await?;
+    debug!("ClickHouse table {} ensured", TABLE_VOLUME_AGGREGATES);
+    Ok(())
+}
+
+pub async fn ensure_ohlcv_table(client: &Client) -> clickhouse::error::Result<()> {
+    let ddl = format!(
+        r#"
+        CREATE TABLE IF NOT EXISTS {TABLE_OHLCV_1M} (
+            mint LowCardinality(String),
+            open Float64 CODEC(Delta, ZSTD(3)),
+            high Float64 CODEC(Delta, ZSTD(3)),
+            low Float64 CODEC(Delta, ZSTD(3)),
+            close Float64 CODEC(Delta, ZSTD(3)),
+            volume Float64 CODEC(Delta, ZSTD(3)),
+            start_time UInt64 CODEC(Delta, ZSTD(3)),
+            duration UInt64 CODEC(Delta, ZSTD(3)),
+            received_at UInt64 CODEC(Delta, ZSTD(3))
+        )
+        ENGINE = ReplacingMergeTree(received_at)
+        PARTITION BY toYYYYMM(toDateTime(start_time))
+        ORDER BY (mint, start_time)
+        "#
+    );
+    client.query(&ddl).execute().await?;
+    debug!("ClickHouse table {} ensured", TABLE_OHLCV_1M);
+    Ok(())
+}
+
 pub async fn ensure_token_launches_table(client: &Client) -> clickhouse::error::Result<()> {
     let ddl = format!(
         r#"
@@ -286,14 +373,85 @@ pub async fn ensure_migrations_table(client: &Client) -> clickhouse::error::Resu
     Ok(())
 }
 
+pub async fn insert_ohlcv_batch(
+    client: &Client,
+    rows: &[OhclvRow],
+) -> clickhouse::error::Result<()> {
+    if rows.is_empty() {
+        return Ok(());
+    }
+    let mut insert = client.insert::<OhclvRow>(TABLE_OHLCV_1M).await?;
+    for row in rows {
+        insert.write(row).await?;
+    }
+    insert.end().await?;
+    Ok(())
+}
+
+pub async fn fetch_aggregated_ohlcv(
+    client: &Client,
+    mint: &str,
+    interval_minutes: u64,
+    from: u64,
+    to: u64,
+) -> clickhouse::error::Result<Vec<OhclvRow>> {
+    let query = format!(
+        r#"
+        SELECT
+            mint,
+            toUnixTimestamp(toStartOfInterval(toDateTime(start_time / 1000000), INTERVAL {interval} MINUTE)) * 1000000 as start_time,
+            argMin(open, start_time) as open,
+            max(high) as high,
+            min(low) as low,
+            argMax(close, start_time) as close,
+            sum(volume) as volume
+        FROM {table}
+        WHERE mint = ? AND start_time >= ? AND start_time <= ?
+        GROUP BY mint, start_time
+        ORDER BY start_time ASC
+        "#,
+        interval = interval_minutes,
+        table = TABLE_OHLCV_1M
+    );
+
+    let cursor = client
+        .query(&query)
+        .bind(mint)
+        .bind(from)
+        .bind(to)
+        .fetch::<OhclvRow>()?;
+
+    let mut rows = Vec::new();
+    let mut stream = cursor;
+    while let Some(row) = stream.next().await? {
+        rows.push(row);
+    }
+    Ok(rows)
+}
+
 pub async fn drop_tables(client: &Client) -> clickhouse::error::Result<()> {
-    for table in [TABLE, TABLE_TOKEN_LAUNCHES, TABLE_TRADES, TABLE_MIGRATIONS] {
+    for table in [TABLE, TABLE_TOKEN_LAUNCHES, TABLE_TRADES, TABLE_MIGRATIONS, TABLE_OHLCV_1M, TABLE_VOLUME_AGGREGATES] {
         client
             .query(&format!("DROP TABLE IF EXISTS {}", table))
             .execute()
             .await?;
         debug!("ClickHouse table {} dropped", table);
     }
+    Ok(())
+}
+
+pub async fn insert_volume_aggregates_batch(
+    client: &Client,
+    rows: &[VolumeAggregateRow],
+) -> clickhouse::error::Result<()> {
+    if rows.is_empty() {
+        return Ok(());
+    }
+    let mut insert = client.insert::<VolumeAggregateRow>(TABLE_VOLUME_AGGREGATES).await?;
+    for row in rows {
+        insert.write(row).await?;
+    }
+    insert.end().await?;
     Ok(())
 }
 

@@ -20,14 +20,15 @@ Config is loaded from the environment and validated at startup. This doc lists e
 | `clickhouse_url` | `Option<String>` | `CLICKHOUSE_URL` | If set and non-empty (and not skip_clickhouse), ClickHouse client is created; metrics and storage writes. |
 | `clickhouse_user` | `Option<String>` | `CLICKHOUSE_USER` | Optional; empty string filtered out. |
 | `clickhouse_password` | `Option<String>` | `CLICKHOUSE_PASSWORD` | Optional; empty string filtered out. |
-| `redis_url` | `Option<String>` | `REDIS_URL` | Optional. When set, storage worker writes snapshot keys (migrated, soon_migrating, launches, trades); WS server can send snapshots from Redis when in-memory state is not used. |
+| `redis_url` | `Option<String>` | `REDIS_URL` | Optional. When set, storage worker writes snapshot keys and cursors to Redis; WS server can also read snapshots from Redis. |
 | `clear_clickhouse` | `bool` | `CLEAR_CLICKHOUSE` | When true (1/true/yes), drop and recreate all pipeline ClickHouse tables on startup. Requires CLICKHOUSE_URL. |
 | `skip_clickhouse` | `bool` | `SKIP_CLICKHOUSE` | When true (1/true/yes), no ClickHouse client; no metrics or storage writes. Redis and WebSocket unchanged. |
 | `clear_clickhouse_only` | `bool` | `CLEAR_CLICKHOUSE_ONLY` | When true (1/true/yes), connect to ClickHouse, drop and recreate tables, then set client to None for the rest of the run (no further writes). Requires CLICKHOUSE_URL. |
-| `health_port` | `u16` | `HEALTH_PORT` | HTTP health server port; 0 = disabled. Default 5567. |
-| `health_grpc_max_age_secs` | `u64` | `HEALTH_GRPC_MAX_AGE_SECS` | Health returns 200 only if last gRPC activity is within this many seconds. Default 120. |
+| `health_port` | `u16` | `HEALTH_PORT` | Reserved; currently HTTP API port is read directly from `HEALTH_PORT` in `main.rs`. |
+| `health_grpc_max_age_secs` | `u64` | `HEALTH_GRPC_MAX_AGE_SECS` | Reserved for future “strict health” semantics. Not used in the current binary. |
 | `snapshot_launch_limit` | `usize` | `WS_INITIAL_SNAPSHOT_LAUNCH_LIMIT` | Max token launches in WS connect snapshot. Default 30. |
 | `snapshot_trade_limit` | `usize` | `WS_INITIAL_SNAPSHOT_TRADE_LIMIT` | Max trades (for those mints) in WS connect snapshot. Default 1000. |
+| `cursor_overlap_slots` | `u64` | `CURSOR_OVERLAP_SLOTS` | How many slots to rewind when resuming from a stored cursor. Default 2. |
 
 ---
 

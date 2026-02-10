@@ -8,13 +8,18 @@ use std::sync::Arc;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{broadcast, RwLock, Semaphore};
 use tokio_tungstenite::tungstenite::Message;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 use redis::AsyncCommands;
+use serde_json;
 
-/// Broadcast channel capacity - handles burst traffic
 const BROADCAST_CAPACITY: usize = 4096;
 
-/// Configuration for the WebSocket server (trading terminal central server).
+#[derive(Clone, Debug)]
+pub struct BroadcastMessage {
+    pub topic: String,
+    pub payload: Bytes,
+}
+
 #[derive(Clone, Debug)]
 pub struct WsConfig {
     pub max_connections: Option<usize>,
@@ -36,7 +41,6 @@ impl Default for WsConfig {
     }
 }
 
-/// Bind with SO_REUSEADDR so restarts don't get "address in use"; optional larger backlog.
 fn bind_reuse(addr: SocketAddr) -> std::io::Result<TcpListener> {
     use socket2::{Domain, Socket, Type};
     let socket = Socket::new(Domain::IPV4, Type::STREAM, None)?;
@@ -48,7 +52,6 @@ fn bind_reuse(addr: SocketAddr) -> std::io::Result<TcpListener> {
     TcpListener::from_std(std_listener)
 }
 
-/// Guard that holds a connection slot when max_connections is set; dropped when connection closes.
 enum ConnectionGuard {
     Unlimited,
     #[allow(dead_code)]
@@ -56,7 +59,7 @@ enum ConnectionGuard {
 }
 
 pub struct WsServer {
-    broadcast_tx: broadcast::Sender<Bytes>,
+    broadcast_tx: broadcast::Sender<Arc<BroadcastMessage>>,
     next_id: AtomicU64,
     client_count: AtomicU64,
     semaphore: Option<Arc<Semaphore>>,
@@ -84,10 +87,9 @@ impl WsServer {
             max_lag_drop: config.max_lag_drop,
             snapshot_state,
             redis_client,
-        }
     }
+}
 
-    /// Acquire a connection slot if limit is set; returns None when at capacity.
     fn try_acquire_connection(self: &Arc<Self>) -> Option<ConnectionGuard> {
         match &self.semaphore {
             Some(s) => s
@@ -99,8 +101,6 @@ impl WsServer {
         }
     }
 
-    /// Starts TCP listener and spawns connection handler for each client.
-    /// Returns a join handle that runs until the listener is closed; await it to keep the process alive.
     pub async fn start(self: &Arc<Self>, port: u16) -> tokio::task::JoinHandle<()> {
         let addr: SocketAddr = ([0, 0, 0, 0], port).into();
         let listener = bind_reuse(addr).expect("Failed to bind WebSocket server");
@@ -130,58 +130,47 @@ impl WsServer {
         })
     }
 
-    /// O(1) broadcast - just writes to channel, no iteration or locks
-    /// Accepts pre-serialized MessagePack binary; uses Bytes for zero-copy clone to subscribers
     #[inline]
-    pub fn broadcast(&self, message: Vec<u8>) {
-        match self.broadcast_tx.send(Bytes::from(message)) {
-            Ok(_) => {}
-            Err(_) => {
-                // No active receivers - this is fine, just means no clients connected
-            }
-        }
+    pub fn broadcast(&self, topic: String, message: Vec<u8>) {
+        let msg = Arc::new(BroadcastMessage {
+            topic,
+            payload: Bytes::from(message),
+        });
+        let _ = self.broadcast_tx.send(msg);
     }
 
-    /// Returns current client count (lock-free atomic read)
     #[inline]
     pub fn client_count(&self) -> u64 {
         self.client_count.load(Ordering::Relaxed)
     }
 
-    /// Subscribe to broadcast channel (called by each client handler)
-    fn subscribe(&self) -> broadcast::Receiver<Bytes> {
+    fn subscribe(&self) -> broadcast::Receiver<Arc<BroadcastMessage>> {
         self.broadcast_tx.subscribe()
     }
 
-    /// Allocate next client ID (lock-free atomic increment)
     fn next_client_id(&self) -> u64 {
         self.next_id.fetch_add(1, Ordering::Relaxed) + 1
     }
 
-    /// Increment client count
     fn client_connected(&self) {
         self.client_count.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Decrement client count
     fn client_disconnected(&self) {
         self.client_count.fetch_sub(1, Ordering::Relaxed);
     }
 }
 
-/// Handles individual WebSocket connection lifecycle
 async fn handle_connection(
     stream: TcpStream,
     server: Arc<WsServer>,
     _guard: ConnectionGuard,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    // TCP optimizations
     stream.set_nodelay(true)?;
 
     let ws_stream = tokio_tungstenite::accept_async(stream).await?;
     let (mut ws_sender, mut ws_receiver) = ws_stream.split();
 
-    // Get client ID and subscribe to broadcast (both lock-free)
     let client_id = server.next_client_id();
     let mut broadcast_rx = server.subscribe();
     
@@ -189,14 +178,11 @@ async fn handle_connection(
     let count = server.client_count();
     info!("Client {} connected ({} total)", client_id, count);
 
-    // Send welcome message (MessagePack binary)
     let welcome = ServerMessage::Connected(ConnectedPayload { client_id });
     let welcome_msg = rmp_serde::to_vec_named(&welcome).unwrap();
     ws_sender.send(Message::Binary(welcome_msg.into())).await?;
 
-    // Snapshot on connect: from in-memory state (no Redis) or from Redis when configured
     if let Some(ref state) = server.snapshot_state {
-        // Avoid race: if snapshot is empty, give storage worker a short time to populate (e.g. first connect)
         let mut snap = state.read().await.clone();
         for attempt in 0..20 {
             if !snap.launches.is_empty() {
@@ -227,7 +213,7 @@ async fn handle_connection(
         if let Ok(bytes) = rmp_serde::to_vec_named(&ServerMessage::SnapshotTrades(snap.trades)) {
             let _ = ws_sender.send(Message::Binary(bytes.into())).await;
         }
-        let tickers: Vec<_> = snap.tickers.values().cloned().collect();
+        let tickers: Vec<_> = snap.tickers.values().map(crate::messages::TokenTicker::from).collect();
         if !tickers.is_empty() {
             if let Ok(bytes) = rmp_serde::to_vec_named(&ServerMessage::SnapshotTickers(tickers)) {
                 let _ = ws_sender.send(Message::Binary(bytes.into())).await;
@@ -270,16 +256,19 @@ async fn handle_connection(
         }
     }
 
-    // Event loop: receive from broadcast channel and handle client messages
+    let mut subscriptions = std::collections::HashSet::new();
+
     loop {
         tokio::select! {
-            // Receive broadcast messages (from the shared channel)
             result = broadcast_rx.recv() => {
                 match result {
                     Ok(msg) => {
-                        // Bytes::clone() is refcount-only; no buffer copy
-                        if ws_sender.send(Message::Binary(msg)).await.is_err() {
-                            break;
+                        let should_send = subscriptions.is_empty() || subscriptions.contains(&msg.topic);
+                        
+                        if should_send {
+                            if ws_sender.send(Message::Binary(msg.payload.clone())).await.is_err() {
+                                break;
+                            }
                         }
                     }
                     Err(broadcast::error::RecvError::Lagged(n)) => {
@@ -300,7 +289,6 @@ async fn handle_connection(
                     }
                 }
             }
-            // Handle incoming client messages (ping/pong/close)
             msg = ws_receiver.next() => {
                 match msg {
                     Some(Ok(Message::Ping(data))) => {
@@ -308,6 +296,24 @@ async fn handle_connection(
                     }
                     Some(Ok(Message::Close(_))) | None => {
                         break;
+                    }
+                    Some(Ok(Message::Text(text))) => {
+                         if let Ok(client_msg) = serde_json::from_str::<crate::messages::ClientMessage>(&text) {
+                            match client_msg {
+                                crate::messages::ClientMessage::Subscribe(topics) => {
+                                    for t in topics {
+                                        subscriptions.insert(t);
+                                    }
+                                    debug!("Client {} subscribed to {} topics", client_id, subscriptions.len());
+                                }
+                                crate::messages::ClientMessage::Unsubscribe(topics) => {
+                                    for t in topics {
+                                        subscriptions.remove(&t);
+                                    }
+                                    debug!("Client {} unsubscribed, remaining: {}", client_id, subscriptions.len());
+                                }
+                            }
+                         }
                     }
                     Some(Err(_)) => {
                         break;

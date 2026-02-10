@@ -1,16 +1,11 @@
 use yellowstone_vixen_core::instruction::InstructionUpdate;
 use crate::events::{Trade, TradeDirection};
 
-/// Minimum size after 8-byte discriminator for buyEvent/sellEvent (through user pubkey at 144).
 const AMM_EVENT_MIN_SIZE: usize = 144 + 32;
-
-/// Buy: after disc, baseAmountOut at 8, quoteAmountIn at 56, pool at 112, user at 144.
 const BUY_TOKEN_OFF: usize = 8;
 const BUY_SOL_OFF: usize = 56;
 const BUY_POOL_BASE_OFF: usize = 40;
 const BUY_POOL_QUOTE_OFF: usize = 48;
-
-/// Sell: after disc, baseAmountIn at 8, quoteAmountOut at 56, pool at 112, user at 144.
 const SELL_TOKEN_OFF: usize = 8;
 const SELL_SOL_OFF: usize = 56;
 const SELL_POOL_BASE_OFF: usize = 40;
@@ -97,6 +92,10 @@ fn decode_buy_event(
         tx_count_5m: 0,
         tx_count_1h: 0,
         tx_count_6h: 0,
+        price_change_5m: 0.0,
+        price_change_1h: 0.0,
+        price_change_6h: 0.0,
+        price_change_24h: 0.0,
         total_fees_sol: 0.0,
     })
 }
@@ -173,51 +172,38 @@ fn decode_sell_event(
         tx_count_5m: 0,
         tx_count_1h: 0,
         tx_count_6h: 0,
+        price_change_5m: 0.0,
+        price_change_1h: 0.0,
+        price_change_6h: 0.0,
+        price_change_24h: 0.0,
         total_fees_sol: 0.0,
     })
 }
 
 fn extract_mint_from_ix(ix: &InstructionUpdate) -> Option<String> {
-    // Per IDL: buy/sell instruction accounts[3] is baseMint (for top-level instructions)
     if let Some(mint) = ix.accounts.get(3).map(|p| bs58::encode(&p.0).into_string()) {
         return Some(mint);
     }
-    
-    // For inner/CPI instructions with limited accounts, look for Token Program TransferChecked
-    // The mint is at accounts[2] in TransferChecked instruction
+
     let token_program = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
     let token_2022_program = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb";
     
     for inner_ix in &ix.inner {
         let program_str = bs58::encode(&inner_ix.program.0).into_string();
         if program_str == token_program || program_str == token_2022_program {
-            // TransferChecked has mint at accounts[2]
             if let Some(mint) = inner_ix.accounts.get(2).map(|p| bs58::encode(&p.0).into_string()) {
                 log::debug!("Extracted mint from inner Token Program TransferChecked: {}", mint);
                 return Some(mint);
             }
         }
     }
-    
-    // Debug logging for failed extraction
+
     log::warn!(
-        "Failed to extract mint: accounts.len()={}, inner.len()={}, program={}", 
+        "Failed to extract mint: accounts.len()={}, inner.len()={}, program={}",
         ix.accounts.len(),
         ix.inner.len(),
         bs58::encode(&ix.program.0).into_string()
     );
-    
-    if ix.inner.len() > 0 {
-        log::debug!("Inner instruction programs:");
-        for (i, inner) in ix.inner.iter().enumerate() {
-            log::debug!("  [{}] program={}, accounts.len()={}", 
-                i, 
-                bs58::encode(&inner.program.0).into_string(),
-                inner.accounts.len()
-            );
-        }
-    }
-    
     None
 }
 
@@ -226,8 +212,6 @@ pub fn parse_amm_trade_events(ix: &InstructionUpdate, received_at: u64) -> Vec<T
     let decoder = base64::engine::general_purpose::STANDARD;
     let signature = bs58::encode(ix.shared.signature.as_slice()).into_string();
 
-    // Skip CPI calls with insufficient accounts - these are inner instructions
-    // The top-level instruction will have the full account list
     if ix.accounts.len() < 4 {
         return vec![];
     }

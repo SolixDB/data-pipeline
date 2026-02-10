@@ -6,10 +6,23 @@ Everything you need to understand and run the data-pipeline is in this directory
 
 ## What this service does
 
-The binary subscribes to a Solana Geyser gRPC stream (Yellowstone), filters for transactions that touch **Pump.fun** or **Pump AMM** programs, parses them into token launches (Create), trades (Buy/Sell), and migrations (Migrate). It broadcasts these events over a WebSocket as MessagePack. If `CLICKHOUSE_URL` is set, it also writes aggregate metrics (launch count, gRPC/server latency) to ClickHouse.
+The binary subscribes to a Solana Geyser gRPC stream (Yellowstone), filters for transactions that touch **Pump.fun** or **Pump AMM** programs, and parses them into:
+
+- Token launches (Create)
+- Trades (Buy/Sell)
+- Migrations (Migrate)
+- OHLCV candles (1m)
+
+It then:
+
+- Broadcasts events over a WebSocket as MessagePack `ServerMessage` values.
+- Runs a Rug Check per mint (SPL mint security) and pushes follow‑up `token_security_update` messages.
+- Writes launches/trades/migrations/ohlcv and volume aggregates to ClickHouse when configured.
+- Maintains in‑memory + optional Redis snapshots for fast warm‑starts.
+- Exposes a small HTTP API (`/config`, `/symbols`, `/history`, `/health`) for charts and health.
 
 - **Input:** Geyser gRPC (transactions).
-- **Output:** WebSocket on `WS_PORT` (default 5566). Each frame is MessagePack: `ServerMessage` (`connected`, `token_launch`, `trade`, `migration`).
+- **Output:** WebSocket on `WS_PORT` (default 5566) and HTTP API on `HEALTH_PORT` (default 5567).
 
 ---
 
@@ -17,23 +30,25 @@ The binary subscribes to a Solana Geyser gRPC stream (Yellowstone), filters for 
 
 | Document | Contents |
 |----------|----------|
-| [main.md](main.md) | Entry point: TLS, logging, config, ClickHouse setup, WebSocket server start, gRPC retry loop, shutdown. Step-by-step. |
+| [main.md](main.md) | Entry point: TLS, logging, config, ClickHouse setup, WebSocket + HTTP API server start, gRPC retry loop, shutdown. |
 | [config.md](config.md) | Config struct, every field, env vars, validation, where it’s used. |
 | [client.md](client.md) | Geyser gRPC client: build, TLS, auth, connect. |
 | [handler.md](handler.md) | Stream loop, transaction handling, parsing pipeline, metrics, broadcast, ping. |
 | [multi_parser.md](multi_parser.md) | Parser map, flatten_instructions, parse_token_launches, parse_trade_events, parse_migration_events, enrich_token_launches. |
-| [events.md](events.md) | Domain types: TokenLaunch, Trade, Migration, BondingCurveState, PumpFunBondingCurveAccounts, PumpProtocolConstants, TradeDirection. Field-by-field. |
-| [messages.md](messages.md) | Wire format: ServerMessage, TokenLaunchPayload, ConnectedPayload. MessagePack, when each message is sent, payload fields. |
-| [ws_server.md](ws_server.md) | WsConfig, WsServer, broadcast channel, accept loop, handle_connection, connection limit, lag disconnect. |
-| [db.md](db.md) | ClickHouse client, pipeline_metrics and storage tables (token_launches, trades, migrations), drop_tables, insert_*, query_holder_stats. |
-| [storage.md](storage.md) | Storage worker: channel consumer, batch ClickHouse writes, SnapshotState (migrated, soon_migrating, configurable launch/trade limits), optional Redis. |
+| [events.md](events.md) | Domain types: TokenLaunch (with MintSecurity), Trade (with volume/price windows), Migration, Ohclv, BondingCurveState, PumpFunBondingCurveAccounts, PumpProtocolConstants, TradeDirection. |
+| [messages.md](messages.md) | Wire format: ServerMessage variants (`token_launch`, `token_security_update`, `trade`, `migration`, `ohclv`, `snapshot_*`), payload fields, connection order. |
+| [ws_server.md](ws_server.md) | WsConfig, WsServer, broadcast channel, accept loop, handle_connection, connection limit, lag disconnect, snapshot-on-connect behaviour. |
+| [db.md](db.md) | ClickHouse client, pipeline_metrics and storage tables (token_launches, trades, migrations, ohlcv, volume_aggregates), drop_tables, insert_*, query_holder_stats. |
+| [storage.md](storage.md) | Storage worker: channel consumer, batch ClickHouse writes, SnapshotState (migrated, soon_migrating, launches, trades, tickers), OHLCV ingestion, periodic volume aggregates, optional Redis. |
 | [protocols.md](protocols.md) | pump_fun: Create/trade/migration detection and parsing (logs + instruction data). pump_amm: AMM buy/sell event layout and parsing. |
-| [pumpfun_accounts.md](pumpfun_accounts.md) | Program IDs, PDA seeds, Create/Buy/Sell account order, what the pipeline sends vs what you derive. For building transactions. |
+| [api.md](api.md) | HTTP API: /config, /symbols, /history, /health. UDF semantics and ClickHouse integration. |
+| [security.md](security.md) | Rug Check: MintSecurity, fetch_mint_security, how results flow into launches and token_security_update. |
+| `FRONTEND.md` | High‑level integration guide for frontend/WebSocket + HTTP consumers. |
 | [RUNBOOK.md](RUNBOOK.md) | Operations: gRPC/data flow, ClickHouse (tables, CLEAR/SKIP/CLEAR_ONLY), parse errors, WebSocket clients. |
 
-**Storage and snapshots:** Handler sends each launch/trade/migration to a bounded channel with backpressure (`send().await`; stream blocks when channel is full). The storage worker buffers rows and bulk-inserts to ClickHouse (flush at 100 rows or 50 ms) and updates in-memory SnapshotState (migrated, soon_migrating, last N launches and their trades; N is configurable via `WS_INITIAL_SNAPSHOT_LAUNCH_LIMIT` and `WS_INITIAL_SNAPSHOT_TRADE_LIMIT`). On WebSocket connect the server sends the four snapshots so clients see migrated/soon-migrating columns even if they weren’t connected during those events. See [storage.md](storage.md) and [messages.md](messages.md).
+**Storage and snapshots:** Handler sends each launch/trade/migration/ohlcv to a bounded channel with backpressure (`send().await`; the gRPC stream slows instead of dropping). The storage worker buffers rows and bulk‑inserts to ClickHouse and updates in‑memory `SnapshotState` (migrated, soon_migrating, launches, trades, tickers); optionally it also persists JSON snapshots and the last processed cursor to Redis. On WebSocket connect the server sends snapshot messages so clients start from a consistent view. See [storage.md](storage.md) and [messages.md](messages.md).
 
-**New to the codebase:** Start with [main.md](main.md) for the big picture, then [handler.md](handler.md) and [multi_parser.md](multi_parser.md) for the data path. Use [messages.md](messages.md) and [pumpfun_accounts.md](pumpfun_accounts.md) when integrating clients or building Pump.fun transactions.
+**New to the codebase:** Start with [main.md](main.md) for the big picture, then [handler.md](handler.md) and [multi_parser.md](multi_parser.md) for the data path. Use [messages.md](messages.md), [events.md](events.md), and `FRONTEND.md` when integrating clients or building Pump.fun transactions.
 
 ---
 

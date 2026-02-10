@@ -98,8 +98,6 @@ pub fn parse_migration_events(
     out
 }
 
-/// Enrich token launches with fee_recipient (from same-tx Buy instruction) and
-/// initial_bonding_curve_state (from first trade in same tx with same mint).
 pub fn enrich_token_launches(
     instructions: &[InstructionUpdate],
     parser_map: &HashMap<Vec<u8>, &'static str>,
@@ -110,8 +108,6 @@ pub fn enrich_token_launches(
     flatten_instructions(instructions, &mut flat);
 
     for launch in launches.iter_mut() {
-        // Fee recipient: from first Pump.fun Buy instruction in same tx with matching mint.
-        // BuyExactSolIn account order: 0=Global, 1=FeeRecipient, 2=Mint, ...
         if launch.pump_accounts.fee_recipient.is_none() {
             for ix in &flat {
                 let ix_sig = bs58::encode(ix.shared.signature.as_slice()).into_string();
@@ -139,7 +135,6 @@ pub fn enrich_token_launches(
             }
         }
 
-        // Initial curve state: from first trade in same tx with same mint.
         if launch.initial_bonding_curve_state.is_none() {
             if let Some(t) = trades.iter().find(|t| t.signature == launch.signature && t.mint == launch.mint) {
                 launch.initial_bonding_curve_state = Some(crate::events::BondingCurveState {

@@ -7,31 +7,29 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 use tracing::{debug, error, info};
 
-/// Shared health state.
-/// Tracks the last time the application performed *real work*.
 pub struct HealthState {
     last_activity_secs: AtomicU64,
 }
 
 impl HealthState {
-    /// Initialize as healthy at startup.
     pub fn new() -> Self {
         Self {
             last_activity_secs: AtomicU64::new(now_secs()),
         }
     }
 
-    /// Call this whenever the app successfully does useful work.
     pub fn record_activity(&self) {
         self.last_activity_secs
             .store(now_secs(), Ordering::Release);
     }
 
+    #[allow(dead_code)]
     fn last_activity(&self) -> u64 {
         self.last_activity_secs.load(Ordering::Acquire)
     }
 }
 
+#[allow(dead_code)]
 pub fn spawn_health_server(port: u16, max_age_secs: u64, state: Arc<HealthState>) {
     if port == 0 {
         return;
@@ -70,6 +68,7 @@ pub fn spawn_health_server(port: u16, max_age_secs: u64, state: Arc<HealthState>
     });
 }
 
+#[allow(dead_code)]
 async fn serve_health(
     mut stream: TcpStream,
     max_age_secs: u64,
@@ -117,6 +116,7 @@ async fn serve_health(
     Ok(())
 }
 
+#[allow(dead_code)]
 fn is_health_request(first_line: &str) -> bool {
     let line = first_line.trim().trim_start_matches('\u{feff}');
     let upper = line.to_ascii_uppercase();

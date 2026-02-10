@@ -2,17 +2,10 @@ use yellowstone_vixen_core::instruction::InstructionUpdate;
 use solana_pubkey::Pubkey;
 use std::str::FromStr;
 
-/// tradeEvent layout (after 8-byte discriminator):
-/// mint(32) + sol(8) + token(8) + is_buy(1) + user(32) + timestamp(8) + reserves/fee...
 const TRADE_EVENT_TIMESTAMP_OFFSET: usize = 8 + 32 + 8 + 8 + 1 + 32;
-/// Minimum size for pump.fun tradeEvent payload (after base64 decode).
 const TRADE_EVENT_MIN_SIZE: usize = 8 + 32 + 8 + 8 + 1 + 32 + 8 + 8 + 8 + 8 + 8 + 32 + 8 + 8;
-
-/// completePumpAmmMigrationEvent: 8(disc) + user(32) + mint(32) + mintAmount(8) + solAmount(8) + fee(8) + bondingCurve(32) + timestamp(8) + pool(32).
-/// completePumpAmmMigrationEvent: 8(disc) + user(32) + mint(32) + mintAmount(8) + solAmount(8) + fee(8) + bondingCurve(32) + timestamp(8) + pool(32).
 const MIGRATION_EVENT_MIN_SIZE: usize = 8 + 32 + 32 + 8 + 8 + 8 + 32 + 8 + 32;
 
-// Mainnet Fee Recipient for Pump.fun
 pub const PUMP_FUN_FEE_RECIPIENT: &str = "CebN5WGQ4jvEPvsVU4EoHEpgzq1VV7AbicfhtW4xC9iM";
 pub const PUMP_FUN_PROGRAM_ID: &str = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P";
 pub const PUMP_FUN_FEE_PROGRAM_ID: &str = "pfeeUxB6jkeY1Hxd7CsFCAjcbHA9rWtchMGdZ6VojVZ";
@@ -36,8 +29,6 @@ pub fn has_migrate_in_logs(ix: &InstructionUpdate) -> bool {
     ix.shared.log_messages.iter().any(|l| l.contains("Instruction: Migrate"))
 }
 
-/// Extract on-chain txn_timestamp (ms) from the first tradeEvent in logs.
-/// For Create, the initial buy tradeEvent typically carries the true on-chain timestamp.
 fn txn_timestamp_from_create_logs(ix: &InstructionUpdate) -> Option<u64> {
     use base64::Engine;
     let decoder = base64::engine::general_purpose::STANDARD;
@@ -94,13 +85,10 @@ pub fn parse_create(ix: &InstructionUpdate, received_at: u64) -> Option<crate::e
         .get(0)
         .map(|p| bs58::encode(&p.0).into_string())
         .unwrap_or_default();
-    // Create instruction account order (pump_fun IDL): 0=mint, 1=mintAuthority, 2=bondingCurve, 3=associatedBondingCurve, 4=global, 5=mplTokenMetadata, 6=metadata, 7=user, ...
     let bonding_curve = ix.accounts.get(2).map(|p| bs58::encode(&p.0).into_string());
     let associated_bonding_curve = ix.accounts.get(3).map(|p| bs58::encode(&p.0).into_string());
     let global = ix.accounts.get(4).map(|p| bs58::encode(&p.0).into_string());
-    
-    // Derive Metadata PDA explicitly to avoid relying on account index
-    // Metadata Program ID: metaqbxxUerdq28cj1RbAWkYQm3ybzjb6a8bt518x1s
+
     let metadata_program_id = Pubkey::from_str("metaqbxxUerdq28cj1RbAWkYQm3ybzjb6a8bt518x1s").unwrap_or_default();
     let mint_pubkey = Pubkey::from_str(&mint).unwrap_or_default();
     let (metadata_pda, _) = Pubkey::find_program_address(
@@ -115,7 +103,6 @@ pub fn parse_create(ix: &InstructionUpdate, received_at: u64) -> Option<crate::e
     let signature = bs58::encode(ix.shared.signature.as_slice()).into_string();
     let txn_timestamp = txn_timestamp_from_create_logs(ix).unwrap_or(received_at / 1000);
 
-    // Derive PDAs
     let pump_program = Pubkey::from_str(PUMP_FUN_PROGRAM_ID).unwrap_or_default();
     let fee_program = Pubkey::from_str(PUMP_FUN_FEE_PROGRAM_ID).unwrap_or_default();
 
@@ -161,6 +148,7 @@ pub fn parse_create(ix: &InstructionUpdate, received_at: u64) -> Option<crate::e
         token_decimals: 6,
         initial_bonding_curve_state: None,
         pump_constants: crate::events::PumpProtocolConstants::default(),
+        security: None,
         txn_timestamp,
         received_at,
         sent_at: 0,
@@ -257,6 +245,10 @@ fn decode_trade_event(
         tx_count_5m: 0,
         tx_count_1h: 0,
         tx_count_6h: 0,
+        price_change_5m: 0.0,
+        price_change_1h: 0.0,
+        price_change_6h: 0.0,
+        price_change_24h: 0.0,
         total_fees_sol: 0.0,
     })
 }

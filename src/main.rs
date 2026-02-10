@@ -9,6 +9,8 @@ mod protocols;
 mod multi_parser;
 mod storage;
 mod ws_server;
+mod api;
+mod security;
 
 use anyhow::Context;
 use backoff::{future, ExponentialBackoff, Error as BackoffError};
@@ -87,12 +89,16 @@ async fn main() -> anyhow::Result<()> {
         db::ensure_token_launches_table(c.as_ref()).await.map_err(|e| anyhow::anyhow!("ClickHouse token_launches: {}", e))?;
         db::ensure_trades_table(c.as_ref()).await.map_err(|e| anyhow::anyhow!("ClickHouse trades: {}", e))?;
         db::ensure_migrations_table(c.as_ref()).await.map_err(|e| anyhow::anyhow!("ClickHouse migrations: {}", e))?;
+        db::ensure_ohlcv_table(c.as_ref()).await.map_err(|e| anyhow::anyhow!("ClickHouse ohlcv: {}", e))?;
+        db::ensure_volume_aggregates_table(c.as_ref()).await.map_err(|e| anyhow::anyhow!("ClickHouse volume_aggregates: {}", e))?;
         if config_arc.clear_clickhouse || config_arc.clear_clickhouse_only {
             db::drop_tables(c.as_ref()).await.map_err(|e| anyhow::anyhow!("ClickHouse drop_tables: {}", e))?;
             db::ensure_table(c.as_ref()).await.map_err(|e| anyhow::anyhow!("ClickHouse ensure_table: {}", e))?;
             db::ensure_token_launches_table(c.as_ref()).await.map_err(|e| anyhow::anyhow!("ClickHouse token_launches: {}", e))?;
             db::ensure_trades_table(c.as_ref()).await.map_err(|e| anyhow::anyhow!("ClickHouse trades: {}", e))?;
             db::ensure_migrations_table(c.as_ref()).await.map_err(|e| anyhow::anyhow!("ClickHouse migrations: {}", e))?;
+            db::ensure_ohlcv_table(c.as_ref()).await.map_err(|e| anyhow::anyhow!("ClickHouse ohlcv: {}", e))?;
+            db::ensure_volume_aggregates_table(c.as_ref()).await.map_err(|e| anyhow::anyhow!("ClickHouse volume_aggregates: {}", e))?;
             info!("ClickHouse tables dropped and recreated");
         }
         if config_arc.clear_clickhouse_only {
@@ -128,11 +134,6 @@ async fn main() -> anyhow::Result<()> {
 
     let health_state = Arc::new(health::HealthState::new());
     health_state.record_activity();
-    health::spawn_health_server(
-        config_arc.health_port,
-        config_arc.health_grpc_max_age_secs,
-        Arc::clone(&health_state),
-    );
 
     let shutdown_rx = {
         let (tx, rx) = tokio::sync::watch::channel(false);
@@ -144,6 +145,19 @@ async fn main() -> anyhow::Result<()> {
         });
         rx
     };
+
+    // Start Combined API + Health Server
+    {
+        let api_client = metrics_client.clone();
+        let api_health = health_state.clone();
+        tokio::spawn(async move {
+            let port = std::env::var("HEALTH_PORT")
+                    .ok()
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(5567);
+            api::ApiServer::start(port, api_client, api_health).await;
+        });
+    }
 
     let storage_tx_for_retry = storage_tx.clone();
     let health_state_for_retry = Arc::clone(&health_state);
@@ -190,8 +204,32 @@ async fn main() -> anyhow::Result<()> {
                 },
             );
 
+            let mut slots = HashMap::new();
+            let mut from_slot: Option<u64> = None;
+            {
+                let state = snapshot_state.read().await;
+                if state.last_processed_slot > 0 {
+                    let resume_from = state
+                        .last_processed_slot
+                        .saturating_sub(config.cursor_overlap_slots);
+                    info!(
+                        "Resuming stream from slot {} (cursor_slot={}, overlap={})",
+                        resume_from, state.last_processed_slot, config.cursor_overlap_slots
+                    );
+                    use yellowstone_grpc_proto::prelude::SubscribeRequestFilterSlots;
+                    slots.insert(
+                        "slots".to_string(),
+                    SubscribeRequestFilterSlots {
+                        filter_by_commitment: Some(true),
+                        interslot_updates: Some(false),
+                    },
+                    );
+                    from_slot = Some(resume_from);
+                }
+            }
+
             let subscribe_request = SubscribeRequest {
-                slots: HashMap::new(),
+                slots,
                 accounts: HashMap::new(),
                 transactions,
                 transactions_status: HashMap::new(),
@@ -201,7 +239,7 @@ async fn main() -> anyhow::Result<()> {
                 commitment: Some(config.commitment as i32),
                 accounts_data_slice: vec![],
                 ping: None,
-                from_slot: None,
+                from_slot,
             };
 
             let (subscribe_tx, stream) = grpc
@@ -210,7 +248,7 @@ async fn main() -> anyhow::Result<()> {
                 .context("subscribe")?;
 
             tokio::select! {
-                result = handle_stream_updates(stream, subscribe_tx, (*config).clone(), ws_server.clone(), parser_map.clone(), metrics_client.clone(), storage_tx.clone(), Some(health_state.clone()), Some(snapshot_state.clone()), redis_client_retry.clone()) => {
+                result = handle_stream_updates(stream, subscribe_tx, (*config).clone(), ws_server.clone(), parser_map.clone(), metrics_client.clone(), storage_tx.clone(), Some(health_state.clone()), Some(snapshot_state.clone()), redis_client_retry.clone(), std::env::var("RPC_URL").ok()) => {
                     result.map_err(|e| {
                         error!("Stream: {}", e);
                         BackoffError::transient(e)
