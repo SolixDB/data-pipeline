@@ -25,6 +25,7 @@ pub struct Config {
     pub health_grpc_max_age_secs: u64,
     pub snapshot_launch_limit: usize,
     pub snapshot_trade_limit: usize,
+    #[allow(dead_code)]
     pub cursor_overlap_slots: u64,
 }
 

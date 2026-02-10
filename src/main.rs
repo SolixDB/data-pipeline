@@ -204,32 +204,18 @@ async fn main() -> anyhow::Result<()> {
                 },
             );
 
-            let mut slots = HashMap::new();
-            let mut from_slot: Option<u64> = None;
             {
                 let state = snapshot_state.read().await;
                 if state.last_processed_slot > 0 {
-                    let resume_from = state
-                        .last_processed_slot
-                        .saturating_sub(config.cursor_overlap_slots);
                     info!(
-                        "Resuming stream from slot {} (cursor_slot={}, overlap={})",
-                        resume_from, state.last_processed_slot, config.cursor_overlap_slots
+                        "Saved cursor: slot={}, tx_index={} (subscribing live; gap can be reindexed later)",
+                        state.last_processed_slot, state.last_processed_tx_index
                     );
-                    use yellowstone_grpc_proto::prelude::SubscribeRequestFilterSlots;
-                    slots.insert(
-                        "slots".to_string(),
-                    SubscribeRequestFilterSlots {
-                        filter_by_commitment: Some(true),
-                        interslot_updates: Some(false),
-                    },
-                    );
-                    from_slot = Some(resume_from);
                 }
             }
 
             let subscribe_request = SubscribeRequest {
-                slots,
+                slots: HashMap::new(),
                 accounts: HashMap::new(),
                 transactions,
                 transactions_status: HashMap::new(),
@@ -239,7 +225,7 @@ async fn main() -> anyhow::Result<()> {
                 commitment: Some(config.commitment as i32),
                 accounts_data_slice: vec![],
                 ping: None,
-                from_slot,
+                from_slot: None,
             };
 
             let (subscribe_tx, stream) = grpc
