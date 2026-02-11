@@ -14,8 +14,10 @@ pub const PUMP_FUN_FEE_PROGRAM_ID: &str = "pfeeUxB6jkeY1Hxd7CsFCAjcbHA9rWtchMGdZ
 const CREATE_DISCRIMINATOR: [u8; 8] = [0x18, 0x1e, 0xc8, 0x28, 0x05, 0x1c, 0x07, 0x77];
 /// CreateV2 instruction discriminator (IDL createV2).
 const CREATE_V2_DISCRIMINATOR: [u8; 8] = [0xd6, 0x90, 0x4c, 0xec, 0x5f, 0x8b, 0x31, 0xb4];
-/// Anchor event discriminator for CreateEvent: first 8 bytes of sha256("event:CreateEvent").
+/// Anchor event discriminator for CreateEvent (PascalCase): first 8 bytes of sha256("event:CreateEvent").
 const CREATE_EVENT_DISCRIMINATOR: [u8; 8] = [27, 114, 169, 77, 222, 235, 99, 118];
+/// Anchor event discriminator for createEvent (camelCase): first 8 bytes of sha256("event:createEvent").
+const CREATE_EVENT_DISCRIMINATOR_CAMEL: [u8; 8] = [161, 122, 54, 229, 163, 163, 105, 102];
 
 fn is_create_instruction(ix: &InstructionUpdate) -> bool {
     ix.data.len() >= 8
@@ -54,11 +56,8 @@ fn txn_timestamp_from_create_logs(ix: &InstructionUpdate) -> Option<u64> {
     use base64::Engine;
     let decoder = base64::engine::general_purpose::STANDARD;
     for log in &ix.shared.log_messages {
-        let data_str = log
-            .trim()
-            .strip_prefix("Program data: ")
-            .or_else(|| log.trim().strip_prefix("> Program data: "))?;
-        let data = decoder.decode(data_str.trim()).ok()?;
+        let data_str = program_data_payload(log)?;
+        let data = decoder.decode(data_str).ok()?;
         if data.len() < TRADE_EVENT_MIN_SIZE {
             continue;
         }
@@ -95,12 +94,16 @@ const CREATE_EVENT_MIN_LEN: usize = 8 + 4 * 3 + 32 * 4 + 8;
 const TIMESTAMP_MIN: u64 = 1577836800;
 const TIMESTAMP_MAX: u64 = 2524608000;
 
-/// Parse createEvent from raw bytes. Requires exact CreateEvent discriminator so we never
+/// Parse createEvent from raw bytes. Requires CreateEvent/createEvent discriminator so we never
 /// mistake trade/migrate/extend events for create. Layout: discriminator(8), name, symbol, uri,
-/// mint(32), bonding_curve(32), user(32), creator(32), timestamp(8).
+/// mint(32), bonding_curve(32), user(32), creator(32), timestamp(8) [, optional u64s...].
 /// Returns (name, symbol, uri, mint, bonding_curve, creator, timestamp_millis).
 fn decode_create_event(data: &[u8]) -> Option<(String, String, String, String, String, String, u64)> {
-    if data.len() < CREATE_EVENT_MIN_LEN || data[0..8] != CREATE_EVENT_DISCRIMINATOR {
+    if data.len() < CREATE_EVENT_MIN_LEN {
+        return None;
+    }
+    let disc = &data[0..8];
+    if disc != CREATE_EVENT_DISCRIMINATOR && disc != CREATE_EVENT_DISCRIMINATOR_CAMEL {
         return None;
     }
     let mut offset = 8;
@@ -124,17 +127,23 @@ fn decode_create_event(data: &[u8]) -> Option<(String, String, String, String, S
     Some((name, symbol, uri, mint, bonding_curve, creator, timestamp_sec as u64 * 1000))
 }
 
+const PROGRAM_DATA_PREFIX: &str = "Program data: ";
+
+fn program_data_payload(log_line: &str) -> Option<&str> {
+    let line = log_line.trim();
+    line.find(PROGRAM_DATA_PREFIX)
+        .map(|i| &line[i + PROGRAM_DATA_PREFIX.len()..])
+        .map(|s| s.trim())
+}
+
 /// Parse createEvent from "Program data:" log (same layout as decode_create_event).
 /// Used when we have an InstructionUpdate (per-instruction fallback).
 fn try_parse_create_event_from_logs(ix: &InstructionUpdate) -> Option<(String, String, String, String, String, String, u64)> {
     use base64::Engine;
     let decoder = base64::engine::general_purpose::STANDARD;
     for log in &ix.shared.log_messages {
-        let data_str = log
-            .trim()
-            .strip_prefix("Program data: ")
-            .or_else(|| log.trim().strip_prefix("> Program data: "))?;
-        let data = decoder.decode(data_str.trim()).ok()?;
+        let data_str = program_data_payload(log)?;
+        let data = decoder.decode(data_str).ok()?;
         if let Some(t) = decode_create_event(&data) {
             return Some(t);
         }
@@ -155,11 +164,8 @@ pub fn parse_create_from_tx_logs(
     let decoder = base64::engine::general_purpose::STANDARD;
     let signature_str = bs58::encode(signature).into_string();
     for log in log_messages {
-        let data_str = log
-            .trim()
-            .strip_prefix("Program data: ")
-            .or_else(|| log.trim().strip_prefix("> Program data: "))?;
-        let data = decoder.decode(data_str.trim()).ok()?;
+        let data_str = program_data_payload(log)?;
+        let data = decoder.decode(data_str).ok()?;
         if let Some((name, symbol, uri, mint, bonding_curve, creator, txn_timestamp)) = decode_create_event(&data) {
             if let Some(mut launch) = build_token_launch_from_event(
                 &signature_str,
@@ -251,11 +257,41 @@ fn build_token_launch_from_event(
     })
 }
 
+/// Extract token launch in a robust order: 1) CreateEvent from logs, 2) Create/CreateV2 instruction, 3) fallback logs.
 pub fn parse_create(ix: &InstructionUpdate, received_at: u64) -> Option<crate::events::TokenLaunch> {
     let signature = bs58::encode(ix.shared.signature.as_slice()).into_string();
-    let txn_timestamp = txn_timestamp_from_create_logs(ix).unwrap_or(received_at / 1000);
 
-    // Path 1: current instruction is Create/CreateV2 (discriminator in ix.data)
+    // 1. CreateEvent — from logs first (most robust; same tx logs on every Pump.fun ix).
+    if let Some((n, s, u, m, bc, c, txn_ts)) = try_parse_create_event_from_logs(ix) {
+        let (abc, g) = if is_create_instruction(ix) {
+            (
+                ix.accounts.get(3).map(|p| bs58::encode(&p.0).into_string()),
+                ix.accounts.get(4).map(|p| bs58::encode(&p.0).into_string()),
+            )
+        } else {
+            (None, None)
+        };
+        if let Some(launch) = build_token_launch(
+            ix,
+            &signature,
+            txn_ts,
+            received_at,
+            true,
+            n,
+            s,
+            u,
+            m,
+            c,
+            Some(bc),
+            abc,
+            g,
+        ) {
+            return Some(launch);
+        }
+    }
+
+    // 2. Create/CreateV2 instruction — use ix.data and accounts when Geyser gives us the Create ix.
+    let txn_timestamp = txn_timestamp_from_create_logs(ix).unwrap_or(received_at / 1000);
     if has_create_in_logs(ix) && is_create_instruction(ix) {
         let is_token_2022 = ix.data.len() >= 8 && ix.data[0..8] == CREATE_V2_DISCRIMINATOR;
 
@@ -321,8 +357,7 @@ pub fn parse_create(ix: &InstructionUpdate, received_at: u64) -> Option<crate::e
         }
     }
 
-    // Path 2: CreateV2 in logs but current instruction is not Create (e.g. Buy in same tx).
-    // Geyser may not give us CreateV2 ix.data; parse launch from createEvent in logs.
+    // 3. Fallback for logs — CreateV2 in logs but not Create ix (e.g. Buy in same tx); Geyser didn't give Create ix.data.
     if has_create_v2_in_logs(ix) {
         if let Some((n, s, u, m, bc, c, txn_ts)) = try_parse_create_event_from_logs(ix) {
             if let Some(launch) = build_token_launch(

@@ -7,6 +7,9 @@ pub struct MintSecurity {
     pub mint: String,
     pub mint_authority: Option<String>,
     pub freeze_authority: Option<String>,
+    /// Total supply in **base units** (raw, same as SPL mint account).
+    /// For "top N hold %": use (sum of holder token balances in base units) / supply * 100, then clamp to 0..100.
+    /// Using supply/10^decimals as denominator while balances are in base units will produce >100%.
     pub supply: u64,
     pub decimals: u8,
     pub is_initialized: bool,
@@ -185,3 +188,14 @@ fn parse_mint_account(data: &[u8], mint: &str) -> anyhow::Result<MintSecurity> {
     })
 }
 
+/// Safe "top N hold %" from sum of balances and supply (all in base units).
+/// Returns 0..100. Use this so the ratio is never inverted and never exceeds 100%.
+#[allow(dead_code)]
+#[inline]
+pub fn holder_pct_clamped(sum_balances_base: u64, supply_base: u64) -> f64 {
+    if supply_base == 0 {
+        0.0
+    } else {
+        (sum_balances_base as f64 / supply_base as f64 * 100.0).min(100.0)
+    }
+}

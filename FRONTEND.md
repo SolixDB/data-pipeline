@@ -131,9 +131,17 @@ Payload:
   - `mint`
   - `mint_authority?`
   - `freeze_authority?`
-  - `supply`, `decimals`, `is_initialized`
-  - `mint_authority_renounced` (bool)
-  - `freeze_authority_renounced` (bool)
+- `supply`, `decimals`, `is_initialized`
+- `mint_authority_renounced` (bool)
+- `freeze_authority_renounced` (bool)
+
+**Supply and “top N hold %”:**
+- `security.supply` is in **base units** (raw token amount, same as the SPL mint account).
+- To show “top 10 hold X%”: get the top 10 token account balances in **base units**, then:
+  - `top10_pct = (sum_of_balances_base / security.supply) * 100`
+  - Clamp the result to `0`–`100`. If you see >100%, the cause is usually:
+    - Using **supply in human form** (supply / 10^decimals) as the denominator while balances are in base units, or
+    - Using the **inverted ratio** (supply / sum) instead of (sum / supply).
 
 Semantics:
 

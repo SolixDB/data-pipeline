@@ -40,7 +40,7 @@ pub fn parse_token_launches(
     let mut out = Vec::new();
     let mut seen = HashSet::new();
 
-    // Primary: rigid log-based CreateV2 detection. Does not depend on Geyser giving us the Create instruction.
+    // 1. CreateEvent — scan tx logs for createEvent (primary; most robust, no Geyser instruction dependency).
     if let Some(pump_ix) = flat.iter().find(|ix| {
         let program_bytes: &[u8] = ix.program.as_ref();
         parser_map.get(program_bytes) == Some(&"pump_fun")
@@ -57,7 +57,7 @@ pub fn parse_token_launches(
         }
     }
 
-    // Fallback: per-instruction parse (uses ix.data when Geyser provides it; enriches abc/g from accounts).
+    // 2. Create/CreateV2 instruction + 3. Fallback for logs — per-instruction (enriches abc/g when available).
     for ix in flat {
         let program_bytes: &[u8] = ix.program.as_ref();
         if parser_map.get(program_bytes) == Some(&"pump_fun") {
