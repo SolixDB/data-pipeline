@@ -8,7 +8,9 @@ use crate::storage::{StorageMessage, SnapshotState, TokenState, MigratedEntry, V
 use crate::ws_server::WsServer;
 use futures::{sink::SinkExt, stream::StreamExt};
 use redis::AsyncCommands;
+use solana_pubkey::Pubkey;
 use std::collections::{HashMap, HashSet};
+use std::str::FromStr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::sync::{mpsc, RwLock};
@@ -145,7 +147,7 @@ pub async fn handle_stream_updates(
                                     metrics_client.clone(),
                                     &storage_tx,
                                     health_state.as_deref(),
-                                    snapshot_state.as_ref().map(|s| s.as_ref()),
+                                    snapshot_state.clone(),
                                     known_mints.clone(),
                                     volume_cache.clone(),
                                     redis_client.clone(),
@@ -271,7 +273,7 @@ async fn handle_transaction(
     metrics_client: Option<Arc<clickhouse::Client>>,
     storage_tx: &mpsc::Sender<StorageMessage>,
     health_state: Option<&HealthState>,
-    snapshot_state: Option<&RwLock<SnapshotState>>,
+    snapshot_state: Option<Arc<RwLock<SnapshotState>>>,
     known_mints: Arc<RwLock<HashSet<String>>>,
     volume_cache: Arc<RwLock<HashMap<String, VolumeMetrics>>>,
     redis_client: Option<Arc<redis::Client>>,
@@ -322,7 +324,95 @@ async fn handle_transaction(
         .map_err(|e| anyhow::anyhow!("parse_from_txn: {:?}", e))?;
     let received_at = unix_timestamp_micros();
 
+    // Parse migrations early so PumpAMM CreatePool can be treated as a token launch (so trades are tracked).
+    let migrations = multi_parser::parse_migration_events(&instructions, parser_map, received_at);
+
+    let known_now: HashSet<String> = known_mints.read().await.clone();
+    let cached_launches: HashSet<String> = if let Some(ref state_lock) = snapshot_state {
+        let r = state_lock.read().await;
+        r.latest_launch_by_mint.keys().cloned().collect()
+    } else {
+        HashSet::new()
+    };
+
+    let mut amm_launches: Vec<crate::events::TokenLaunch> = Vec::new();
+    for m in &migrations {
+        // CreatePoolEvent from pump_amm: when the mint isn't known yet, treat it as a new token launch.
+        if m.quote_mint.is_none() {
+            continue;
+        }
+        if m.mint.is_empty() {
+            continue;
+        }
+        if known_now.contains(&m.mint) || cached_launches.contains(&m.mint) {
+            continue;
+        }
+
+        // If we already know a bonding curve for this mint (Redis), this CreatePool is a Pump.fun -> AMM migration,
+        // not an AMM-direct launch.
+        let mut has_bonding_curve = false;
+        if let Some(ref r) = redis_client {
+            if let Ok(mut conn) = r.get_multiplexed_async_connection().await {
+                if let Ok(bc) = conn.hget::<_, _, String>("bonding_curves", &m.mint).await {
+                    has_bonding_curve = !bc.is_empty();
+                }
+            }
+        }
+        if has_bonding_curve {
+            continue;
+        }
+
+        let creator = m
+            .coin_creator
+            .clone()
+            .unwrap_or_else(|| if !m.user.is_empty() { m.user.clone() } else { String::new() });
+
+        let metadata = Pubkey::from_str(&m.mint).ok().map(|mint_pubkey| {
+            let metadata_program_id =
+                Pubkey::from_str("metaqbxxUerdq28cj1RbAWkYQm3ybzjb6a8bt518x1s").unwrap_or_default();
+            let (metadata_pda, _) = Pubkey::find_program_address(
+                &[b"metadata", metadata_program_id.as_ref(), mint_pubkey.as_ref()],
+                &metadata_program_id,
+            );
+            metadata_pda.to_string()
+        });
+
+        amm_launches.push(crate::events::TokenLaunch {
+            signature: m.signature.clone(),
+            slot: m.slot,
+            mint: m.mint.clone(),
+            // Placeholder: we'll fetch real metadata over RPC asap and rebroadcast.
+            name: m.mint.clone(),
+            symbol: String::new(),
+            uri: String::new(),
+            creator: creator.clone(),
+            user: creator,
+            pump_accounts: crate::events::PumpFunBondingCurveAccounts {
+                bonding_curve: None,
+                associated_bonding_curve: None,
+                global: None,
+                fee_recipient: None,
+                metadata,
+                creator_vault: None,
+                fee_config: None,
+                event_authority: None,
+            },
+            token_decimals: 6,
+            initial_bonding_curve_state: None,
+            pump_constants: crate::events::PumpProtocolConstants::default(),
+            security: None,
+            is_token_2022: false,
+            txn_timestamp: m.txn_timestamp,
+            received_at,
+            sent_at: 0,
+            token_total_supply: None,
+            token_program: None,
+            is_mayhem_mode: m.is_mayhem_mode,
+        });
+    }
+
     let mut launches = multi_parser::parse_token_launches(&instructions, parser_map, received_at);
+    launches.extend(amm_launches);
     let mut trades = multi_parser::parse_trade_events(&instructions, parser_map, received_at);
     multi_parser::enrich_token_launches(&instructions, parser_map, &mut launches, &trades);
 
@@ -352,7 +442,8 @@ async fn handle_transaction(
             debug!("Skipping launch with empty mint");
             continue;
         }
-        // CreateEvent is present on every pump.fun launch and carries name/symbol/uri. Do not send a launch with no token details.
+        // Pump.fun: CreateEvent carries name/symbol/uri.
+        // PumpAMM direct CreatePool: we may emit a placeholder launch and then fill details via RPC.
         let has_display_data = !launch.name.is_empty() || !launch.symbol.is_empty() || !launch.uri.is_empty();
         if !has_display_data {
             debug!(
@@ -448,6 +539,8 @@ async fn handle_transaction(
         let mint_for_tracking_bg = mint_for_tracking.clone();
         let bonding_curve_for_tracking_bg = bonding_curve_for_tracking.clone();
         let mut launch_bg = launch.clone();
+        let snapshot_state_bg = snapshot_state.clone();
+        let needs_rpc_metadata = launch_bg.symbol.is_empty() && launch_bg.uri.is_empty();
 
         tokio::spawn(async move {
             if let Some(url) = rpc_url_bg.as_deref() {
@@ -475,6 +568,77 @@ async fn handle_transaction(
                     }
                     Err(_) => {
                         debug!("Security fetch timeout for {}", mint_for_security);
+                    }
+                }
+            }
+
+            // For PumpAMM direct CreatePool launches (no Pump.fun CreateEvent), best-effort fetch token metadata via RPC
+            // and then rebroadcast + persist an updated token_launch.
+            if needs_rpc_metadata {
+                if let Some(url) = rpc_url_bg.as_deref() {
+                    match tokio::time::timeout(
+                        std::time::Duration::from_millis(800),
+                        crate::token_metadata::fetch_metaplex_metadata(url, &launch_bg.mint),
+                    )
+                    .await
+                    {
+                        Ok(Ok(Some(meta))) => {
+                            if !meta.name.is_empty() {
+                                launch_bg.name = meta.name;
+                            }
+                            if !meta.symbol.is_empty() {
+                                launch_bg.symbol = meta.symbol;
+                            }
+                            if !meta.uri.is_empty() {
+                                launch_bg.uri = meta.uri;
+                            }
+
+                            if let Some(ref state_lock) = snapshot_state_bg {
+                                let mut w = state_lock.write().await;
+                                let (price, market_cap, liquidity_sol) = w.tickers
+                                    .get(&launch_bg.mint)
+                                    .map(|t| (t.price, t.market_cap, t.liquidity_sol))
+                                    .unwrap_or((0.0, 0.0, 0.0));
+                                let payload = TokenLaunchPayload {
+                                    signature: launch_bg.signature.clone(),
+                                    slot: launch_bg.slot,
+                                    mint: launch_bg.mint.clone(),
+                                    name: launch_bg.name.clone(),
+                                    symbol: launch_bg.symbol.clone(),
+                                    uri: launch_bg.uri.clone(),
+                                    creator: launch_bg.creator.clone(),
+                                    user: launch_bg.user.clone(),
+                                    pump_accounts: launch_bg.pump_accounts.clone(),
+                                    token_decimals: launch_bg.token_decimals,
+                                    initial_bonding_curve_state: launch_bg.initial_bonding_curve_state,
+                                    pump_constants: launch_bg.pump_constants.clone(),
+                                    security: launch_bg.security.clone(),
+                                    price,
+                                    market_cap,
+                                    liquidity_sol,
+                                    txn_timestamp: launch_bg.txn_timestamp,
+                                    is_token_2022: launch_bg.is_token_2022,
+                                    token_total_supply: launch_bg.token_total_supply,
+                                    token_program: launch_bg.token_program.clone(),
+                                    is_mayhem_mode: launch_bg.is_mayhem_mode,
+                                };
+                                w.latest_launch_by_mint.insert(launch_bg.mint.clone(), payload.clone());
+                                if let Ok(bytes) =
+                                    rmp_serde::to_vec_named(&ServerMessage::TokenLaunch(payload))
+                                {
+                                    ws_server_bg.broadcast("launches".to_string(), bytes.clone());
+                                    ws_server_bg.broadcast(launch_bg.mint.clone(), bytes);
+                                }
+                            }
+
+                            // Persist updated metadata (latest row wins in /token).
+                            let _ = storage_tx_bg
+                                .send(StorageMessage::TokenLaunch(launch_bg.clone()))
+                                .await;
+                        }
+                        Ok(Ok(None)) => {}
+                        Ok(Err(e)) => debug!("Metadata fetch failed for {}: {}", launch_bg.mint, e),
+                        Err(_) => debug!("Metadata fetch timeout for {}", launch_bg.mint),
                     }
                 }
             }
@@ -528,8 +692,15 @@ async fn handle_transaction(
                 }
             }
         }
-        if let Some(state_lock) = snapshot_state {
+        if let Some(ref state_lock) = snapshot_state {
             let mut w = state_lock.write().await;
+            let is_pump_fun_token = w
+                .latest_launch_by_mint
+                .get(&trade.mint)
+                .and_then(|p| p.pump_accounts.bonding_curve.as_ref())
+                .map(|s| !s.is_empty())
+                .unwrap_or(false);
+
             let token_state = w.tickers.entry(trade.mint.clone())
                 .or_insert_with(|| TokenState::new(trade.mint.clone()));
 
@@ -611,7 +782,9 @@ async fn handle_transaction(
 
             trade.total_fees_sol = token_state.total_fees_sol;
 
-            if !trade.is_bonding_curve && token_state.migrated_to_pool.is_none() {
+            // Infer migration only for Pump.fun bonding-curve tokens.
+            // PumpAMM-direct launches start on AMM, so we must not mark them as "migrated".
+            if is_pump_fun_token && !trade.is_bonding_curve && token_state.migrated_to_pool.is_none() {
                  if let Some(pool) = &trade.pool {
                      if !pool.is_empty() {
                          let pool_clone = pool.clone();
@@ -755,9 +928,40 @@ async fn handle_transaction(
     }
 
     // Migrations can happen long after launch; don't gate on `known_mints` or we miss snapshot_migrated.
-    let migrations = multi_parser::parse_migration_events(&instructions, parser_map, received_at);
     for mut migration in migrations {
-        if let Some(state_lock) = snapshot_state {
+        // If this is a PumpAMM CreatePool "direct launch" (no Pump.fun bonding curve), do not emit Migration,
+        // otherwise frontend will treat the token as migrated.
+        if migration.quote_mint.is_some() {
+            let mut has_bonding_curve = false;
+            if let Some(ref r) = redis_client {
+                if let Ok(mut conn) = r.get_multiplexed_async_connection().await {
+                    if let Ok(bc) = conn.hget::<_, _, String>("bonding_curves", &migration.mint).await
+                    {
+                        has_bonding_curve = !bc.is_empty();
+                    }
+                }
+            }
+
+            // Fallback to in-memory snapshot if Redis isn't available.
+            if !has_bonding_curve {
+                has_bonding_curve = if let Some(ref state_lock) = snapshot_state {
+                    let r = state_lock.read().await;
+                    r.latest_launch_by_mint
+                        .get(&migration.mint)
+                        .and_then(|p| p.pump_accounts.bonding_curve.as_ref())
+                        .map(|s| !s.is_empty())
+                        .unwrap_or(false)
+                } else {
+                    false
+                };
+            }
+
+            if !has_bonding_curve {
+                continue;
+            }
+        }
+
+        if let Some(ref state_lock) = snapshot_state {
             let mut launch_payload_opt = None;
             {
                 let mut w = state_lock.write().await;

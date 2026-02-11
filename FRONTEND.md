@@ -78,7 +78,9 @@ The server does not send acks for subscribe/unsubscribe; just start / stop getti
 
 ## Token details: single source of truth
 
-**Every pump.fun launch includes a CreateEvent in logs**, so the pipeline only sends a `token_launch` when it has token details (name, symbol, uri). If you see a mint with no name/symbol/uri, the cause is on the frontend: you must treat **`token_launch` and `snapshot_launches` as the only source of truth for token metadata** and merge by mint.
+**Pump.fun launches** include a CreateEvent in logs, so the pipeline normally sends `token_launch` with token details (`name`, `symbol`, `uri`) from that CreateEvent.
+
+**PumpAMM direct launches** (a token is minted “normally” and then a pool is created via `CreatePool`) may arrive as a `token_launch` with **placeholder metadata** (often `name = mint`, `symbol = ""`, `uri = ""`) so the mint enters the list and AMM trades can be tracked immediately. The pipeline then does an **RPC metadata fetch** and will **rebroadcast** `token_launch` with real `name/symbol/uri` as soon as it can.
 
 - **Token metadata** (name, symbol, uri, creator, user, PDAs, curve state, etc.) comes **only** from:
   - Live `token_launch` messages (topic `"launches"`), and
@@ -145,7 +147,12 @@ Follow these steps so mints never appear without token details.
 
 ### 3. `token_launch`
 
-Payload (`TokenLaunchPayload`). Same shape is used for **live** `token_launch` and for **snapshot_launches** on connect. **The pipeline only sends a launch when it has token details (name/symbol/uri from CreateEvent).** Use this payload as the single source of truth for token metadata (see “Token details: single source of truth” and “Frontend implementation” above).
+Payload (`TokenLaunchPayload`). Same shape is used for **live** `token_launch` and for **snapshot_launches** on connect.
+
+- **Pump.fun**: token details come from CreateEvent, so `name/symbol/uri` are expected to be filled immediately.
+- **PumpAMM direct CreatePool**: the first `token_launch` may have placeholder `name/symbol/uri`, followed by a later `token_launch` update after the pipeline backfills metadata via RPC.
+
+Use this payload as the single source of truth for token metadata (see “Token details: single source of truth” and “Frontend implementation” above).
 
 - **Identity:** `signature`, `slot`, `mint`
 - **Display:** `name`, `symbol`, `uri`, `creator`

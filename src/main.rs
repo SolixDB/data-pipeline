@@ -11,6 +11,7 @@ mod storage;
 mod ws_server;
 mod api;
 mod security;
+mod token_metadata;
 
 use anyhow::Context;
 use backoff::{future, ExponentialBackoff, Error as BackoffError};
