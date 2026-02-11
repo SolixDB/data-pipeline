@@ -74,6 +74,8 @@ pub struct TokenLaunch {
     pub uri: String,
     pub creator: String,
     #[serde(default)]
+    pub user: String,
+    #[serde(default)]
     pub pump_accounts: PumpFunBondingCurveAccounts,
     #[serde(default = "default_token_decimals")]
     pub token_decimals: u8,
@@ -87,6 +89,12 @@ pub struct TokenLaunch {
     pub txn_timestamp: u64,
     pub received_at: u64,
     pub sent_at: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub token_total_supply: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub token_program: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub is_mayhem_mode: Option<bool>,
 }
 
 fn default_token_decimals() -> u8 {

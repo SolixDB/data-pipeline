@@ -4,7 +4,7 @@ use crate::events::{TradeDirection, Migration};
 use crate::health::HealthState;
 use crate::messages::{ServerMessage, TokenLaunchPayload, TokenSecurityUpdate, TokenTicker};
 use crate::multi_parser;
-use crate::storage::{StorageMessage, SnapshotState, TokenState, MigratedEntry};
+use crate::storage::{StorageMessage, SnapshotState, TokenState, MigratedEntry, VolumeMetrics};
 use crate::ws_server::WsServer;
 use futures::{sink::SinkExt, stream::StreamExt};
 use redis::AsyncCommands;
@@ -51,6 +51,7 @@ pub async fn handle_stream_updates(
     storage_tx: mpsc::Sender<StorageMessage>,
     health_state: Option<Arc<HealthState>>,
     snapshot_state: Option<Arc<RwLock<SnapshotState>>>,
+    volume_cache: Arc<RwLock<HashMap<String, VolumeMetrics>>>,
     redis_client: Option<Arc<redis::Client>>,
     rpc_url: Option<String>,
 ) -> anyhow::Result<()> {
@@ -146,6 +147,7 @@ pub async fn handle_stream_updates(
                                     health_state.as_deref(),
                                     snapshot_state.as_ref().map(|s| s.as_ref()),
                                     known_mints.clone(),
+                                    volume_cache.clone(),
                                     redis_client.clone(),
                                     rpc_url.as_deref(),
                                     recent_sigs.clone(),
@@ -177,11 +179,58 @@ pub async fn handle_stream_updates(
             }
             _ = volume_interval.tick() => {
                 if let Some(ref state_lock) = snapshot_state {
-                    let r = state_lock.read().await;
                     let delay = crate::storage::volume_display_delay_secs();
-                    let tickers: Vec<TokenTicker> = r.tickers.values()
+                    if let Some(ref ch) = metrics_client {
+                        let mints: Vec<String> = {
+                            let r = state_lock.read().await;
+                            r.tickers.keys().cloned().collect()
+                        };
+                        if !mints.is_empty() {
+                            match db::fetch_volume_metrics_batch(ch.as_ref(), &mints, delay).await {
+                                Ok(rows) => {
+                                    let mut cache = volume_cache.write().await;
+                                    for row in rows {
+                                        cache.insert(
+                                            row.mint.clone(),
+                                            VolumeMetrics {
+                                                volume_5m: row.volume_5m,
+                                                volume_1h: row.volume_1h,
+                                                volume_6h: row.volume_6h,
+                                                volume_24h: row.volume_24h,
+                                                tx_count_5m: row.tx_count_5m,
+                                                tx_count_1h: row.tx_count_1h,
+                                                tx_count_6h: row.tx_count_6h,
+                                                tx_count_24h: row.tx_count_24h,
+                                                price_change_5m: 0.0,
+                                                price_change_1h: 0.0,
+                                                price_change_6h: 0.0,
+                                                price_change_24h: 0.0,
+                                            },
+                                        );
+                                    }
+                                }
+                                Err(e) => {
+                                    debug!("ClickHouse volume fetch failed: {}", e);
+                                }
+                            }
+                        }
+                    }
+                    let r = state_lock.read().await;
+                    let cache = volume_cache.read().await;
+                    let tickers: Vec<TokenTicker> = r
+                        .tickers
+                        .values()
                         .map(|t| {
-                            let vol = t.volume_metrics_delayed(delay);
+                            let vol: VolumeMetrics = if let Some(cached) = cache.get(&t.mint) {
+                                let mut m = cached.clone();
+                                m.price_change_5m = t.volume_metrics.price_change_5m;
+                                m.price_change_1h = t.volume_metrics.price_change_1h;
+                                m.price_change_6h = t.volume_metrics.price_change_6h;
+                                m.price_change_24h = t.volume_metrics.price_change_24h;
+                                m
+                            } else {
+                                t.volume_metrics_delayed(delay)
+                            };
                             TokenTicker {
                                 mint: t.mint.clone(),
                                 price: t.price,
@@ -195,8 +244,11 @@ pub async fn handle_stream_updates(
                         })
                         .collect();
                     drop(r);
+                    drop(cache);
                     if !tickers.is_empty() {
-                        if let Ok(bytes) = rmp_serde::to_vec_named(&ServerMessage::SnapshotTickers(tickers)) {
+                        if let Ok(bytes) =
+                            rmp_serde::to_vec_named(&ServerMessage::SnapshotTickers(tickers))
+                        {
                             ws_server.broadcast("tickers".to_string(), bytes);
                         }
                     }
@@ -221,6 +273,7 @@ async fn handle_transaction(
     health_state: Option<&HealthState>,
     snapshot_state: Option<&RwLock<SnapshotState>>,
     known_mints: Arc<RwLock<HashSet<String>>>,
+    volume_cache: Arc<RwLock<HashMap<String, VolumeMetrics>>>,
     redis_client: Option<Arc<redis::Client>>,
     rpc_url: Option<&str>,
     recent_sigs: Arc<RwLock<HashMap<String, u64>>>,
@@ -273,24 +326,17 @@ async fn handle_transaction(
     let mut trades = multi_parser::parse_trade_events(&instructions, parser_map, received_at);
     multi_parser::enrich_token_launches(&instructions, parser_map, &mut launches, &trades);
 
-    // Mint -> creator so we can mark dev buy (trader == creator); frontend can show mcap when only dev bought.
+    // Mint -> creator so we can mark dev buy (trader == creator). Build from this tx's launches + existing snapshot only (recent_launches updated after we send to frontend).
     let mut mint_creator: HashMap<String, String> = HashMap::new();
     for launch in &launches {
         mint_creator.insert(launch.mint.clone(), launch.creator.clone());
     }
     if let Some(ref state_lock) = snapshot_state {
-        let mut w = state_lock.write().await;
-        for launch in &launches {
-            w.recent_launches.push_back((launch.mint.clone(), launch.creator.clone(), received_at));
-        }
-        let cutoff = received_at.saturating_sub(crate::storage::RECENT_LAUNCHES_WINDOW_MICROS);
-        while w.recent_launches.front().map(|(_, _, ts)| *ts < cutoff).unwrap_or(false) {
-            w.recent_launches.pop_front();
-        }
-        for (mint, creator, _) in &w.recent_launches {
+        let r = state_lock.read().await;
+        for (mint, creator, _) in &r.recent_launches {
             mint_creator.entry(mint.clone()).or_insert_with(|| creator.clone());
         }
-        for l in &w.launches {
+        for l in &r.launches {
             mint_creator.entry(l.mint.clone()).or_insert_with(|| l.creator.clone());
         }
     }
@@ -302,16 +348,16 @@ async fn handle_transaction(
     }
 
     for mut launch in launches {
-        let has_display_data = !launch.mint.is_empty()
-            && (!launch.name.is_empty() || !launch.symbol.is_empty() || !launch.uri.is_empty());
+        if launch.mint.is_empty() {
+            debug!("Skipping launch with empty mint");
+            continue;
+        }
+        let has_display_data = !launch.name.is_empty() || !launch.symbol.is_empty() || !launch.uri.is_empty();
         if !has_display_data {
             debug!(
-                "Skipping launch with no display data: mint={} name={:?} symbol={:?}",
-                &launch.mint,
-                launch.name.is_empty(),
-                launch.symbol.is_empty()
+                "Launch with no name/symbol/uri (sending anyway): mint={}",
+                &launch.mint
             );
-            continue;
         }
 
         // Add to known_mints immediately so trades in this tx (e.g. dev buy) are not skipped.
@@ -358,6 +404,7 @@ async fn handle_transaction(
             symbol: launch.symbol.clone(),
             uri: launch.uri.clone(),
             creator: launch.creator.clone(),
+            user: launch.user.clone(),
             pump_accounts: launch.pump_accounts.clone(),
             token_decimals: launch.token_decimals,
             initial_bonding_curve_state: launch.initial_bonding_curve_state,
@@ -366,14 +413,27 @@ async fn handle_transaction(
             price,
             market_cap,
             liquidity_sol,
+            txn_timestamp: launch.txn_timestamp,
+            is_token_2022: launch.is_token_2022,
+            token_total_supply: launch.token_total_supply,
+            token_program: launch.token_program.clone(),
+            is_mayhem_mode: launch.is_mayhem_mode,
         };
 
-        // Send launch (and mcap/price/liquidity) immediately without awaiting; accurate and fast.
-        // Security fetch, storage, Redis run in a background task so they never block mcap.
+        // Send launch to frontend first; then update snapshot (recent_launches) so snapshot never has stale or partial data.
         if let Ok(bytes) = rmp_serde::to_vec_named(&ServerMessage::TokenLaunch(payload)) {
             ws_server.broadcast("launches".to_string(), bytes);
         }
         debug!("{} | clients={}", log_msg, ws_server.client_count());
+
+        if let Some(ref state_lock) = snapshot_state {
+            let mut w = state_lock.write().await;
+            w.recent_launches.push_back((launch.mint.clone(), launch.creator.clone(), received_at));
+            let cutoff = received_at.saturating_sub(crate::storage::RECENT_LAUNCHES_WINDOW_MICROS);
+            while w.recent_launches.front().map(|(_, _, ts)| *ts < cutoff).unwrap_or(false) {
+                w.recent_launches.pop_front();
+            }
+        }
 
         let metrics_client_bg = metrics_client.clone();
         let storage_tx_bg = storage_tx.clone();
@@ -521,20 +581,28 @@ async fn handle_transaction(
             let fee_sol = trade.fee as f64 / 1_000_000_000.0;
             token_state.total_fees_sol += fee_sol;
 
-            let delayed = token_state.volume_metrics_delayed(crate::storage::volume_display_delay_secs());
+            let delay = crate::storage::volume_display_delay_secs();
+            let delayed = if metrics_client.is_some() {
+                let cache = volume_cache.read().await;
+                cache
+                    .get(&trade.mint)
+                    .cloned()
+                    .unwrap_or_default()
+            } else {
+                token_state.volume_metrics_delayed(delay)
+            };
             trade.volume_sol = delayed.volume_24h;
             trade.volume_5m = delayed.volume_5m;
             trade.volume_1h = delayed.volume_1h;
             trade.volume_6h = delayed.volume_6h;
-
             trade.tx_count = delayed.tx_count_24h;
             trade.tx_count_5m = delayed.tx_count_5m;
             trade.tx_count_1h = delayed.tx_count_1h;
             trade.tx_count_6h = delayed.tx_count_6h;
-            trade.price_change_5m = delayed.price_change_5m;
-            trade.price_change_1h = delayed.price_change_1h;
-            trade.price_change_6h = delayed.price_change_6h;
-            trade.price_change_24h = delayed.price_change_24h;
+            trade.price_change_5m = token_state.volume_metrics.price_change_5m;
+            trade.price_change_1h = token_state.volume_metrics.price_change_1h;
+            trade.price_change_6h = token_state.volume_metrics.price_change_6h;
+            trade.price_change_24h = token_state.volume_metrics.price_change_24h;
 
             trade.total_fees_sol = token_state.total_fees_sol;
 

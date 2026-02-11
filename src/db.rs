@@ -176,6 +176,8 @@ pub struct TradeRow {
     pub suggested_compute_unit_limit: u32,
     pub received_at: u64,
     pub sent_at: u64,
+    /// On-chain time (ms) for volume windows; 0 means use received_at.
+    pub txn_timestamp: u64,
 }
 
 #[derive(Debug, Row, Serialize, Deserialize)]
@@ -335,7 +337,8 @@ pub async fn ensure_trades_table(client: &Client) -> clickhouse::error::Result<(
             token_decimals UInt8,
             suggested_compute_unit_limit UInt32,
             received_at UInt64 CODEC(Delta, ZSTD(3)),
-            sent_at UInt64 CODEC(Delta, ZSTD(3))
+            sent_at UInt64 CODEC(Delta, ZSTD(3)),
+            txn_timestamp UInt64 CODEC(Delta, ZSTD(3)) DEFAULT 0
         )
         ENGINE = ReplacingMergeTree(received_at)
         PARTITION BY toYYYYMM(toDateTime(received_at / 1000000))
@@ -344,6 +347,7 @@ pub async fn ensure_trades_table(client: &Client) -> clickhouse::error::Result<(
     );
     client.query(&ddl).execute().await?;
     debug!("ClickHouse table {} ensured", TABLE_TRADES);
+    // If the table already existed without txn_timestamp, run: ALTER TABLE trades ADD COLUMN txn_timestamp UInt64 DEFAULT 0
     Ok(())
 }
 
@@ -371,6 +375,29 @@ pub async fn ensure_migrations_table(client: &Client) -> clickhouse::error::Resu
     client.query(&ddl).execute().await?;
     debug!("ClickHouse table {} ensured", TABLE_MIGRATIONS);
     Ok(())
+}
+
+/// Minimal token metadata for HTTP API (e.g. /symbols). Fetched from token_launches by mint.
+#[derive(Debug, Row, Serialize, Deserialize)]
+pub struct TokenMetadataRow {
+    pub name: String,
+    pub symbol: String,
+    pub uri: String,
+}
+
+/// Fetches name, symbol, uri for a mint from token_launches (latest by received_at). Returns None if not found.
+pub async fn fetch_token_metadata(
+    client: &Client,
+    mint: &str,
+) -> clickhouse::error::Result<Option<TokenMetadataRow>> {
+    let mut cursor = client
+        .query(&format!(
+            "SELECT name, symbol, uri FROM {TABLE_TOKEN_LAUNCHES} WHERE mint = ? ORDER BY received_at DESC LIMIT 1"
+        ))
+        .bind(mint)
+        .fetch::<TokenMetadataRow>()?;
+    let first = cursor.next().await?;
+    Ok(first)
 }
 
 pub async fn insert_ohlcv_batch(
@@ -424,6 +451,93 @@ pub async fn fetch_aggregated_ohlcv(
     let mut rows = Vec::new();
     let mut stream = cursor;
     while let Some(row) = stream.next().await? {
+        rows.push(row);
+    }
+    Ok(rows)
+}
+
+/// Result row for volume aggregation from trades (no price_change; v1 uses in-memory for that).
+#[derive(Debug, Row, Serialize, Deserialize)]
+pub struct VolumeMetricsResultRow {
+    pub mint: String,
+    pub volume_5m: f64,
+    pub volume_1h: f64,
+    pub volume_6h: f64,
+    pub volume_24h: f64,
+    pub tx_count_5m: u64,
+    pub tx_count_1h: u64,
+    pub tx_count_6h: u64,
+    pub tx_count_24h: u64,
+}
+
+/// Fetch volume and tx_count aggregates from trades for the given mints. Uses received_at (micros)
+/// for time windows. Excludes the last `delay_secs` seconds so display aligns with delayed terminals.
+pub async fn fetch_volume_metrics_batch(
+    client: &Client,
+    mints: &[String],
+    delay_secs: u64,
+) -> clickhouse::error::Result<Vec<VolumeMetricsResultRow>> {
+    if mints.is_empty() {
+        return Ok(Vec::new());
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_micros() as u64;
+    let end = now.saturating_sub(delay_secs * 1_000_000);
+    const US_5M: u64 = 5 * 60 * 1_000_000;
+    const US_1H: u64 = 60 * 60 * 1_000_000;
+    const US_6H: u64 = 6 * 60 * 60 * 1_000_000;
+    const US_24H: u64 = 24 * 60 * 60 * 1_000_000;
+    let end_5m_start = end.saturating_sub(US_5M);
+    let end_1h_start = end.saturating_sub(US_1H);
+    let end_6h_start = end.saturating_sub(US_6H);
+    let end_24h_start = end.saturating_sub(US_24H);
+
+    let in_list = mints
+        .iter()
+        .map(|m| format!("'{}'", m.replace('\'', "''")))
+        .collect::<Vec<_>>()
+        .join(",");
+    let query = format!(
+        r#"
+        SELECT mint,
+            sumIf(sol_amount, received_at >= ? AND received_at <= ?) / 1000000000.0 AS volume_5m,
+            countIf(received_at >= ? AND received_at <= ?) AS tx_count_5m,
+            sumIf(sol_amount, received_at >= ? AND received_at <= ?) / 1000000000.0 AS volume_1h,
+            countIf(received_at >= ? AND received_at <= ?) AS tx_count_1h,
+            sumIf(sol_amount, received_at >= ? AND received_at <= ?) / 1000000000.0 AS volume_6h,
+            countIf(received_at >= ? AND received_at <= ?) AS tx_count_6h,
+            sumIf(sol_amount, received_at >= ? AND received_at <= ?) / 1000000000.0 AS volume_24h,
+            countIf(received_at >= ? AND received_at <= ?) AS tx_count_24h
+        FROM {table}
+        WHERE mint IN ({in_list})
+        GROUP BY mint
+        "#,
+        table = TABLE_TRADES,
+        in_list = in_list
+    );
+    let mut cursor = client
+        .query(&query)
+        .bind(end_5m_start)
+        .bind(end)
+        .bind(end_5m_start)
+        .bind(end)
+        .bind(end_1h_start)
+        .bind(end)
+        .bind(end_1h_start)
+        .bind(end)
+        .bind(end_6h_start)
+        .bind(end)
+        .bind(end_6h_start)
+        .bind(end)
+        .bind(end_24h_start)
+        .bind(end)
+        .bind(end_24h_start)
+        .bind(end)
+        .fetch::<VolumeMetricsResultRow>()?;
+    let mut rows = Vec::new();
+    while let Some(row) = cursor.next().await? {
         rows.push(row);
     }
     Ok(rows)

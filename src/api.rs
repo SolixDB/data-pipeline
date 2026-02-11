@@ -83,12 +83,43 @@ async fn get_config() -> impl IntoResponse {
     Json(config)
 }
 
-async fn get_symbols(Query(params): Query<std::collections::HashMap<String, String>>) -> impl IntoResponse {
+async fn get_symbols(
+    State(state): State<AppState>,
+    Query(params): Query<std::collections::HashMap<String, String>>,
+) -> impl IntoResponse {
     let symbol = params.get("symbol").cloned().unwrap_or_default();
+    let (name, full_name, description) = if symbol.is_empty() {
+        (symbol.clone(), symbol.clone(), "Token".to_string())
+    } else if let Some(ref client) = state.clickhouse {
+        match db::fetch_token_metadata(client.as_ref(), &symbol).await {
+            Ok(Some(meta)) => {
+                let n = meta.name.trim();
+                let s = meta.symbol.trim();
+                let (display_name, display_full, desc) = if n.is_empty() && s.is_empty() {
+                    (symbol.clone(), symbol.clone(), format!("Token {}", symbol))
+                } else {
+                    let name_display = if !s.is_empty() { s.to_string() } else { n.to_string() };
+                    let full_display = if !n.is_empty() { n.to_string() } else { symbol.clone() };
+                    let desc = if !n.is_empty() && !s.is_empty() {
+                        format!("{} ({})", n, s)
+                    } else if !n.is_empty() {
+                        n.to_string()
+                    } else {
+                        s.to_string()
+                    };
+                    (name_display, full_display, desc)
+                };
+                (display_name, display_full, desc)
+            }
+            _ => (symbol.clone(), symbol.clone(), format!("Token {}", symbol)),
+        }
+    } else {
+        (symbol.clone(), symbol.clone(), format!("Token {}", symbol))
+    };
     let info = UdfSymbolInfo {
-        name: symbol.clone(),
-        full_name: symbol.clone(),
-        description: format!("Token {}", symbol),
+        name,
+        full_name,
+        description,
         type_: "crypto".to_string(),
         session: "24x7".to_string(),
         exchange: "DEX".to_string(),
@@ -102,7 +133,6 @@ async fn get_symbols(Query(params): Query<std::collections::HashMap<String, Stri
         volume_precision: 2,
         data_status: "streaming".to_string(),
     };
-    
     Json(info)
 }
 

@@ -10,6 +10,8 @@ pub struct TokenLaunchPayload {
     pub uri: String,
     pub creator: String,
     #[serde(default)]
+    pub user: String,
+    #[serde(default)]
     pub pump_accounts: crate::events::PumpFunBondingCurveAccounts,
     #[serde(default)]
     pub token_decimals: u8,
@@ -24,6 +26,16 @@ pub struct TokenLaunchPayload {
     pub market_cap: f64,
     #[serde(default)]
     pub liquidity_sol: f64,
+    #[serde(default)]
+    pub txn_timestamp: u64,
+    #[serde(default)]
+    pub is_token_2022: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub token_total_supply: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub token_program: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub is_mayhem_mode: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -23,7 +23,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::RwLock;
 use tracing::{error, info, warn};
-use storage::SnapshotState;
+use storage::{SnapshotState, VolumeMetrics};
 use ws_server::WsServer;
 use yellowstone_grpc_proto::prelude::{
     SubscribeRequest, SubscribeRequestFilterTransactions,
@@ -107,6 +107,8 @@ async fn main() -> anyhow::Result<()> {
         }
     }
     let metrics_client_for_handler = metrics_client.clone();
+    let volume_cache: Arc<RwLock<HashMap<String, VolumeMetrics>>> =
+        Arc::new(RwLock::new(HashMap::new()));
 
     let (storage_tx, storage_rx) = tokio::sync::mpsc::channel(50_000);
     storage::spawn_storage_worker(
@@ -162,6 +164,7 @@ async fn main() -> anyhow::Result<()> {
     let storage_tx_for_retry = storage_tx.clone();
     let health_state_for_retry = Arc::clone(&health_state);
     let snapshot_state_for_retry = Arc::clone(&snapshot_state);
+    let volume_cache_for_retry = Arc::clone(&volume_cache);
     let run = future::retry(backoff, move || {
         let client = Arc::clone(&client);
         let config = Arc::clone(&config_arc);
@@ -170,6 +173,7 @@ async fn main() -> anyhow::Result<()> {
         let storage_tx = storage_tx_for_retry.clone();
         let health_state = Arc::clone(&health_state_for_retry);
         let snapshot_state = Arc::clone(&snapshot_state_for_retry);
+        let volume_cache = Arc::clone(&volume_cache_for_retry);
         let redis_client_retry = redis_client_for_handler.clone();
         let mut shutdown_rx = shutdown_rx.clone();
 
@@ -234,7 +238,7 @@ async fn main() -> anyhow::Result<()> {
                 .context("subscribe")?;
 
             tokio::select! {
-                result = handle_stream_updates(stream, subscribe_tx, (*config).clone(), ws_server.clone(), parser_map.clone(), metrics_client.clone(), storage_tx.clone(), Some(health_state.clone()), Some(snapshot_state.clone()), redis_client_retry.clone(), std::env::var("RPC_URL").ok()) => {
+                result = handle_stream_updates(stream, subscribe_tx, (*config).clone(), ws_server.clone(), parser_map.clone(), metrics_client.clone(), storage_tx.clone(), Some(health_state.clone()), Some(snapshot_state.clone()), volume_cache.clone(), redis_client_retry.clone(), std::env::var("RPC_URL").ok()) => {
                     result.map_err(|e| {
                         error!("Stream: {}", e);
                         BackoffError::transient(e)

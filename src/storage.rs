@@ -599,6 +599,7 @@ pub fn spawn_storage_worker(
                         symbol: launch.symbol.clone(),
                         uri: launch.uri.clone(),
                         creator: launch.creator.clone(),
+                        user: launch.user.clone(),
                         pump_accounts: launch.pump_accounts.clone(),
                         token_decimals: launch.token_decimals,
                         initial_bonding_curve_state: launch.initial_bonding_curve_state,
@@ -607,6 +608,11 @@ pub fn spawn_storage_worker(
                         price,
                         market_cap,
                         liquidity_sol,
+                        txn_timestamp: launch.txn_timestamp,
+                        is_token_2022: launch.is_token_2022,
+                        token_total_supply: launch.token_total_supply,
+                        token_program: launch.token_program.clone(),
+                        is_mayhem_mode: launch.is_mayhem_mode,
                     };
 
                     last_launches.push_front(payload);
@@ -683,6 +689,7 @@ pub fn spawn_storage_worker(
                             suggested_compute_unit_limit: trade.suggested_compute_unit_limit,
                             received_at: trade.received_at,
                             sent_at: trade.sent_at,
+                            txn_timestamp: trade.txn_timestamp,
                         });
                     }
 

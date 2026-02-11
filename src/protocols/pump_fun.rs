@@ -93,16 +93,35 @@ fn read_length_prefixed_string(data: &[u8], offset: &mut usize) -> Option<String
 
 /// Minimum size for createEvent: discriminator(8) + at least 3 length-prefixed strings + 4*32 + 8.
 const CREATE_EVENT_MIN_LEN: usize = 8 + 4 * 3 + 32 * 4 + 8;
+/// createEvent continues with virtualTokenReserves, virtualSolReserves, realTokenReserves, tokenTotalSupply (4*u64), tokenProgram(32), isMayhemMode(u8).
+const CREATE_EVENT_BONDING_OFFSET: usize = 136;
+const CREATE_EVENT_EXTRA_LEN: usize = 32 + 1; // after 4*u64: tokenProgram(32) + isMayhemMode(1)
 
 /// Valid timestamp range (roughly 2020–2050).
 const TIMESTAMP_MIN: u64 = 1577836800;
 const TIMESTAMP_MAX: u64 = 2524608000;
 
+/// Parsed createEvent: all IDL fields we care to send (user, tokenTotalSupply, tokenProgram, isMayhemMode).
+pub struct CreateEventParsed {
+    pub name: String,
+    pub symbol: String,
+    pub uri: String,
+    pub mint: String,
+    pub bonding_curve: String,
+    pub user: String,
+    pub creator: String,
+    pub timestamp_millis: u64,
+    pub initial_bonding_curve_state: Option<crate::events::BondingCurveState>,
+    pub token_total_supply: Option<u64>,
+    pub token_program: Option<String>,
+    pub is_mayhem_mode: Option<bool>,
+}
+
 /// Parse createEvent from raw bytes. Requires CreateEvent/createEvent discriminator so we never
-/// mistake trade/migrate/extend events for create. Layout: discriminator(8), name, symbol, uri,
-/// mint(32), bonding_curve(32), user(32), creator(32), timestamp(8) [, optional u64s...].
-/// Returns (name, symbol, uri, mint, bonding_curve, creator, timestamp_millis).
-fn decode_create_event(data: &[u8]) -> Option<(String, String, String, String, String, String, u64)> {
+/// mistake trade/migrate/extend events for create. Full IDL layout: discriminator(8), name, symbol, uri,
+/// mint(32), bondingCurve(32), user(32), creator(32), timestamp(i64), virtualTokenReserves(u64),
+/// virtualSolReserves(u64), realTokenReserves(u64), tokenTotalSupply(u64), tokenProgram(32), isMayhemMode(u8).
+fn decode_create_event(data: &[u8]) -> Option<CreateEventParsed> {
     if data.len() < CREATE_EVENT_MIN_LEN {
         return None;
     }
@@ -119,7 +138,7 @@ fn decode_create_event(data: &[u8]) -> Option<(String, String, String, String, S
     }
     let mint = bs58::encode(&data[offset..offset + 32]).into_string();
     let bonding_curve = bs58::encode(&data[offset + 32..offset + 64]).into_string();
-    let _user = bs58::encode(&data[offset + 64..offset + 96]).into_string();
+    let user = bs58::encode(&data[offset + 64..offset + 96]).into_string();
     let creator = bs58::encode(&data[offset + 96..offset + 128]).into_string();
     let timestamp_sec = i64::from_le_bytes(data[offset + 128..offset + 136].try_into().ok()?);
     if !(TIMESTAMP_MIN..=TIMESTAMP_MAX).contains(&(timestamp_sec as u64)) {
@@ -128,7 +147,41 @@ fn decode_create_event(data: &[u8]) -> Option<(String, String, String, String, S
     if mint.is_empty() || bonding_curve.is_empty() || creator.is_empty() {
         return None;
     }
-    Some((name, symbol, uri, mint, bonding_curve, creator, timestamp_sec as u64 * 1000))
+    let timestamp_millis = timestamp_sec as u64 * 1000;
+    let base = offset + CREATE_EVENT_BONDING_OFFSET;
+    let has_bonding = data.len() >= base + 8 * 4;
+    let initial_bonding_curve_state = has_bonding.then(|| {
+        crate::events::BondingCurveState {
+            virtual_token_reserves: u64::from_le_bytes(data[base..base + 8].try_into().unwrap_or([0; 8])),
+            virtual_sol_reserves: u64::from_le_bytes(data[base + 8..base + 16].try_into().unwrap_or([0; 8])),
+            real_token_reserves: u64::from_le_bytes(data[base + 16..base + 24].try_into().unwrap_or([0; 8])),
+            real_sol_reserves: 0,
+        }
+    });
+    let token_total_supply = has_bonding.then(|| {
+        u64::from_le_bytes(data[base + 24..base + 32].try_into().unwrap_or([0; 8]))
+    });
+    let (token_program, is_mayhem_mode) = if data.len() >= base + 8 * 4 + CREATE_EVENT_EXTRA_LEN {
+        let tp = bs58::encode(&data[base + 32..base + 64]).into_string();
+        let mayhem = data.get(base + 64).copied().unwrap_or(0) != 0;
+        (Some(tp), Some(mayhem))
+    } else {
+        (None, None)
+    };
+    Some(CreateEventParsed {
+        name,
+        symbol,
+        uri,
+        mint,
+        bonding_curve,
+        user,
+        creator,
+        timestamp_millis,
+        initial_bonding_curve_state,
+        token_total_supply,
+        token_program,
+        is_mayhem_mode,
+    })
 }
 
 const PROGRAM_DATA_PREFIX: &str = "Program data: ";
@@ -142,7 +195,7 @@ fn program_data_payload(log_line: &str) -> Option<&str> {
 
 /// Parse createEvent from "Program data:" log (same layout as decode_create_event).
 /// Used when we have an InstructionUpdate (per-instruction fallback).
-fn try_parse_create_event_from_logs(ix: &InstructionUpdate) -> Option<(String, String, String, String, String, String, u64)> {
+fn try_parse_create_event_from_logs(ix: &InstructionUpdate) -> Option<CreateEventParsed> {
     use base64::Engine;
     let decoder = base64::engine::general_purpose::STANDARD;
     for log in &ix.shared.log_messages {
@@ -170,20 +223,25 @@ pub fn parse_create_from_tx_logs(
     for log in log_messages {
         let data_str = program_data_payload(log)?;
         let data = decoder.decode(data_str).ok()?;
-        if let Some((name, symbol, uri, mint, bonding_curve, creator, txn_timestamp)) = decode_create_event(&data) {
+        if let Some(parsed) = decode_create_event(&data) {
             if let Some(mut launch) = build_token_launch_from_event(
                 &signature_str,
                 slot,
                 received_at,
                 true,
-                name,
-                symbol,
-                uri,
-                mint,
-                creator,
-                bonding_curve,
+                parsed.name,
+                parsed.symbol,
+                parsed.uri,
+                parsed.mint,
+                parsed.creator,
+                parsed.bonding_curve,
+                parsed.initial_bonding_curve_state,
+                parsed.user,
+                parsed.token_total_supply,
+                parsed.token_program,
+                parsed.is_mayhem_mode,
             ) {
-                launch.txn_timestamp = txn_timestamp;
+                launch.txn_timestamp = parsed.timestamp_millis;
                 return Some(launch);
             }
         }
@@ -204,6 +262,11 @@ fn build_token_launch_from_event(
     mint: String,
     creator: String,
     bonding_curve: String,
+    initial_bonding_curve_state: Option<crate::events::BondingCurveState>,
+    user: String,
+    token_total_supply: Option<u64>,
+    token_program: Option<String>,
+    is_mayhem_mode: Option<bool>,
 ) -> Option<crate::events::TokenLaunch> {
     let metadata_program_id = Pubkey::from_str("metaqbxxUerdq28cj1RbAWkYQm3ybzjb6a8bt518x1s").unwrap_or_default();
     let mint_pubkey = Pubkey::from_str(&mint).unwrap_or_default();
@@ -249,15 +312,19 @@ fn build_token_launch_from_event(
         symbol,
         uri,
         creator,
+        user,
         pump_accounts,
         token_decimals: 6,
-        initial_bonding_curve_state: None,
+        initial_bonding_curve_state,
         pump_constants: crate::events::PumpProtocolConstants::default(),
         security: None,
         is_token_2022,
         txn_timestamp: received_at / 1000,
         received_at,
         sent_at: 0,
+        token_total_supply,
+        token_program,
+        is_mayhem_mode,
     })
 }
 
@@ -266,7 +333,7 @@ pub fn parse_create(ix: &InstructionUpdate, received_at: u64) -> Option<crate::e
     let signature = bs58::encode(ix.shared.signature.as_slice()).into_string();
 
     // 1. CreateEvent — from logs first (most robust; same tx logs on every Pump.fun ix).
-    if let Some((n, s, u, m, bc, c, txn_ts)) = try_parse_create_event_from_logs(ix) {
+    if let Some(parsed) = try_parse_create_event_from_logs(ix) {
         let (abc, g) = if is_create_instruction(ix) {
             (
                 ix.accounts.get(3).map(|p| bs58::encode(&p.0).into_string()),
@@ -275,21 +342,26 @@ pub fn parse_create(ix: &InstructionUpdate, received_at: u64) -> Option<crate::e
         } else {
             (None, None)
         };
-        if let Some(launch) = build_token_launch(
+        if let Some(mut launch) = build_token_launch(
             ix,
             &signature,
-            txn_ts,
+            parsed.timestamp_millis,
             received_at,
             true,
-            n,
-            s,
-            u,
-            m,
-            c,
-            Some(bc),
+            parsed.name,
+            parsed.symbol,
+            parsed.uri,
+            parsed.mint,
+            parsed.creator,
+            Some(parsed.bonding_curve),
             abc,
             g,
         ) {
+            launch.initial_bonding_curve_state = parsed.initial_bonding_curve_state;
+            launch.user = parsed.user;
+            launch.token_total_supply = parsed.token_total_supply;
+            launch.token_program = parsed.token_program;
+            launch.is_mayhem_mode = parsed.is_mayhem_mode;
             return Some(launch);
         }
     }
@@ -337,24 +409,29 @@ pub fn parse_create(ix: &InstructionUpdate, received_at: u64) -> Option<crate::e
         }
 
         if is_token_2022 {
-            if let Some((n, s, u, m, bc, c, txn_ts)) = try_parse_create_event_from_logs(ix) {
+            if let Some(parsed) = try_parse_create_event_from_logs(ix) {
                 let abc = ix.accounts.get(3).map(|p| bs58::encode(&p.0).into_string());
                 let g = ix.accounts.get(4).map(|p| bs58::encode(&p.0).into_string());
-                if let Some(launch) = build_token_launch(
+                if let Some(mut launch) = build_token_launch(
                     ix,
                     &signature,
-                    txn_ts,
+                    parsed.timestamp_millis,
                     received_at,
                     true,
-                    n,
-                    s,
-                    u,
-                    m,
-                    c,
-                    Some(bc),
+                    parsed.name,
+                    parsed.symbol,
+                    parsed.uri,
+                    parsed.mint,
+                    parsed.creator,
+                    Some(parsed.bonding_curve),
                     abc,
                     g,
                 ) {
+                    launch.initial_bonding_curve_state = parsed.initial_bonding_curve_state;
+                    launch.user = parsed.user;
+                    launch.token_total_supply = parsed.token_total_supply;
+                    launch.token_program = parsed.token_program;
+                    launch.is_mayhem_mode = parsed.is_mayhem_mode;
                     return Some(launch);
                 }
             }
@@ -363,22 +440,27 @@ pub fn parse_create(ix: &InstructionUpdate, received_at: u64) -> Option<crate::e
 
     // 3. Fallback for logs — CreateV2 in logs but not Create ix (e.g. Buy in same tx); Geyser didn't give Create ix.data.
     if has_create_v2_in_logs(ix) {
-        if let Some((n, s, u, m, bc, c, txn_ts)) = try_parse_create_event_from_logs(ix) {
-            if let Some(launch) = build_token_launch(
+        if let Some(parsed) = try_parse_create_event_from_logs(ix) {
+            if let Some(mut launch) = build_token_launch(
                 ix,
                 &signature,
-                txn_ts,
+                parsed.timestamp_millis,
                 received_at,
                 true,
-                n,
-                s,
-                u,
-                m,
-                c,
-                Some(bc),
+                parsed.name,
+                parsed.symbol,
+                parsed.uri,
+                parsed.mint,
+                parsed.creator,
+                Some(parsed.bonding_curve),
                 None,
                 None,
             ) {
+                launch.initial_bonding_curve_state = parsed.initial_bonding_curve_state;
+                launch.user = parsed.user;
+                launch.token_total_supply = parsed.token_total_supply;
+                launch.token_program = parsed.token_program;
+                launch.is_mayhem_mode = parsed.is_mayhem_mode;
                 return Some(launch);
             }
         }
@@ -446,6 +528,7 @@ fn build_token_launch(
         symbol,
         uri,
         creator,
+        user: String::new(),
         pump_accounts,
         token_decimals: 6,
         initial_bonding_curve_state: None,
@@ -455,6 +538,9 @@ fn build_token_launch(
         txn_timestamp,
         received_at,
         sent_at: 0,
+        token_total_supply: None,
+        token_program: None,
+        is_mayhem_mode: None,
     })
 }
 

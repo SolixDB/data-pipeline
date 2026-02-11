@@ -41,14 +41,13 @@ pub fn parse_token_launches(
     let mut seen = HashSet::new();
 
     // 1. CreateEvent — scan tx logs for createEvent (primary; most robust, no Geyser instruction dependency).
-    if let Some(pump_ix) = flat.iter().find(|ix| {
-        let program_bytes: &[u8] = ix.program.as_ref();
-        parser_map.get(program_bytes) == Some(&"pump_fun")
-    }) {
+    // Use transaction-level logs from any instruction (all share the same log_messages) so we don't miss
+    // creates when no pump_fun instruction is present in the flattened list (e.g. subscription filter).
+    if let Some(any_ix) = flat.first() {
         if let Some(launch) = protocols::pump_fun::parse_create_from_tx_logs(
-            &pump_ix.shared.log_messages,
-            &pump_ix.shared.signature,
-            pump_ix.shared.slot,
+            &any_ix.shared.log_messages,
+            &any_ix.shared.signature,
+            any_ix.shared.slot,
             received_at,
         ) {
             if seen.insert((launch.signature.clone(), launch.mint.clone())) {
