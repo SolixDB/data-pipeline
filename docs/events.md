@@ -69,7 +69,7 @@ See [pumpfun_accounts.md](pumpfun_accounts.md) for derivation.
 
 ## TokenLaunch
 
-One new token (Pump.fun Create). Produced by `pump_fun::parse_create`; enriched by `enrich_token_launches` and, later, Rug Check.
+One new token (Pump.fun Create). Produced by `pump_fun::parse_create`; enriched by `enrich_token_launches`. The pipeline does not currently attach Rug Check results.
 
 | Field | Type | Meaning |
 |-------|------|--------|
@@ -82,12 +82,12 @@ One new token (Pump.fun Create). Produced by `pump_fun::parse_create`; enriched 
 | token_decimals | u8 | 6. |
 | initial_bonding_curve_state | Option<BondingCurveState> | From same-tx trade if present. |
 | pump_constants | PumpProtocolConstants | Program IDs and decimals. |
-| security | Option<MintSecurity> | Optional Rug Check result attached by background task. |
+| security | Option<MintSecurity> | Optional mint security; pipeline currently leaves this `None`. |
 | txn_timestamp | u64 | Ms since epoch (from logs or received_at). |
 | received_at | u64 | Server received (μs). |
 | sent_at | u64 | Set by handler before broadcast. |
 
-On the initial live launch, `security` is usually `None`. Storage and snapshots hold the enriched value when Rug Check completes.
+The pipeline does not currently run Rug Check; `security` remains `None`.
 
 ---
 
@@ -106,7 +106,7 @@ Result of Rug Check against the SPL mint account.
 | mint_authority_renounced | bool | `true` when `mint_authority` is `None`. |
 | freeze_authority_renounced | bool | `true` when `freeze_authority` is `None`. |
 
-This is derived from on‑chain account data via `security::fetch_mint_security` and is sent over the wire as part of `TokenLaunchPayload.security` and `TokenSecurityUpdate.security`.
+This is derived from on‑chain account data via `security::fetch_mint_security`. The pipeline does not currently send it; `TokenLaunchPayload.security` is always `null`.
 
 ---
 

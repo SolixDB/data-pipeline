@@ -16,7 +16,7 @@ This document walks through the binary from startup to shutdown. No external ref
 6. Build optional ClickHouse client (unless SKIP_CLICKHOUSE); ensure pipeline_metrics and storage tables; if CLEAR_CLICKHOUSE or CLEAR_CLICKHOUSE_ONLY, drop and recreate tables; if CLEAR_CLICKHOUSE_ONLY set metrics_client to None for the rest of the run.
 7. Spawn storage worker (channel receiver, ClickHouse client, redis_url, snapshot state, config.snapshot_launch_limit, config.snapshot_trade_limit).
 8. Set up shutdown (Ctrl+C) and gRPC retry backoff.
-9. Retry loop: connect gRPC, call health_state.record_activity(), subscribe to transactions (Pump.fun + Pump AMM), run `handle_stream_updates` (with storage_tx, health_state, snapshot_state, Redis client, and optional RPC_URL for Rug Check) until stream ends or shutdown. On stream error, backoff and reconnect.
+9. Retry loop: connect gRPC, call health_state.record_activity(), subscribe to transactions (Pump.fun + Pump AMM), run `handle_stream_updates` (with storage_tx, health_state, snapshot_state, Redis client, and optional RPC_URL e.g. for metadata backfill) until stream ends or shutdown. On stream error, backoff and reconnect.
 10. Process exits when retry gives up or shutdown is requested.
 
 ---

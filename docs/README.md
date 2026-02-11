@@ -16,7 +16,6 @@ The binary subscribes to a Solana Geyser gRPC stream (Yellowstone), filters for 
 It then:
 
 - Broadcasts events over a WebSocket as MessagePack `ServerMessage` values.
-- Runs a Rug Check per mint (SPL mint security) and pushes follow‑up `token_security_update` messages.
 - Writes launches/trades/migrations/ohlcv and volume aggregates to ClickHouse when configured.
 - Maintains in‑memory + optional Redis snapshots for fast warm‑starts.
 - Exposes a small HTTP API (`/config`, `/symbols`, `/history`, `/health`) for charts and health.
@@ -36,13 +35,13 @@ It then:
 | [handler.md](handler.md) | Stream loop, transaction handling, parsing pipeline, metrics, broadcast, ping. |
 | [multi_parser.md](multi_parser.md) | Parser map, flatten_instructions, parse_token_launches, parse_trade_events, parse_migration_events, enrich_token_launches. |
 | [events.md](events.md) | Domain types: TokenLaunch (with MintSecurity), Trade (with volume/price windows), Migration, Ohclv, BondingCurveState, PumpFunBondingCurveAccounts, PumpProtocolConstants, TradeDirection. |
-| [messages.md](messages.md) | Wire format: ServerMessage variants (`token_launch`, `token_security_update`, `trade`, `migration`, `ohclv`, `snapshot_*`), payload fields, connection order. |
+| [messages.md](messages.md) | Wire format: ServerMessage variants (`token_launch`, `trade`, `migration`, `ohclv`, `snapshot_*`), payload fields, connection order. |
 | [ws_server.md](ws_server.md) | WsConfig, WsServer, broadcast channel, accept loop, handle_connection, connection limit, lag disconnect, snapshot-on-connect behaviour. |
 | [db.md](db.md) | ClickHouse client, pipeline_metrics and storage tables (token_launches, trades, migrations, ohlcv, volume_aggregates), drop_tables, insert_*, query_holder_stats. |
 | [storage.md](storage.md) | Storage worker: channel consumer, batch ClickHouse writes, SnapshotState (migrated, soon_migrating, launches, trades, tickers), OHLCV ingestion, periodic volume aggregates, optional Redis. |
 | [protocols.md](protocols.md) | pump_fun: Create/trade/migration detection and parsing (logs + instruction data). pump_amm: AMM buy/sell event layout and parsing. |
 | [api.md](api.md) | HTTP API: /config, /symbols, /history, /health. UDF semantics and ClickHouse integration. |
-| [security.md](security.md) | Rug Check: MintSecurity, fetch_mint_security, how results flow into launches and token_security_update. |
+| [security.md](security.md) | MintSecurity, fetch_mint_security; pipeline does not currently run Rug Check or send security updates. |
 | `FRONTEND.md` | High‑level integration guide for frontend/WebSocket + HTTP consumers. |
 | [RUNBOOK.md](RUNBOOK.md) | Operations: gRPC/data flow, ClickHouse (tables, CLEAR/SKIP/CLEAR_ONLY), parse errors, WebSocket clients. |
 

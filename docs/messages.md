@@ -18,7 +18,6 @@ Types sent over the WebSocket are `ServerMessage` values encoded as MessagePack.
 
 - `connected` → `Connected(ConnectedPayload)`
 - `token_launch` → `TokenLaunch(TokenLaunchPayload)`
-- `token_security_update` → `TokenSecurityUpdate(TokenSecurityUpdate)`
 - `trade` → `Trade(crate::events::Trade)`
 - `migration` → `Migration(crate::events::Migration)`
 - `ohclv` → `Ohclv(crate::events::Ohclv)`
@@ -44,7 +43,7 @@ Sent by ws_server in handle_connection immediately after accept. See [ws_server.
 
 ## TokenLaunchPayload
 
-Same information as `events::TokenLaunch`, with an optional embedded Rug Check result.
+Same information as `events::TokenLaunch`. The `security` field is currently always `null`; no live security updates are sent.
 
 | Field | Type | Meaning |
 |-------|------|--------|
@@ -57,30 +56,7 @@ Same information as `events::TokenLaunch`, with an optional embedded Rug Check r
 | token_decimals | u8 | 6. |
 | initial_bonding_curve_state | Option<BondingCurveState> | From same-tx trade when available. |
 | pump_constants | PumpProtocolConstants | program_ids and token_decimals. |
-| security | Option<MintSecurity> | Rug Check mint security; usually null on the first `token_launch`. |
-
-Notes:
-
-- On the initial `token_launch` the `security` field is typically `null`; Rug Check runs in a background task.
-- On later snapshots (`snapshot_launches`) and for stored launches, `security` is populated when Rug Check succeeded.
-
-See [events.md](events.md) for `MintSecurity`.
-
----
-
-## TokenSecurityUpdate
-
-Follow-up message when Rug Check completes for a mint.
-
-| Field | Type | Meaning |
-|-------|------|--------|
-| mint | String | Mint this update applies to. |
-| security | MintSecurity | Parsed SPL mint security. |
-
-Behaviour:
-
-- Emitted once per mint when background Rug Check succeeds.
-- Broadcast on topic = mint, so subscribers to that mint see the update without reconnecting.
+| security | Option<MintSecurity> | Mint security; currently always `null`. See [security.md](security.md). |
 
 ---
 
@@ -125,7 +101,7 @@ Same struct as events::Migration. Fields: signature, slot, mint, user, bonding_c
 4. **snapshot_launches** — Once. Last 50 launches; replace or init launch feed.
 5. **snapshot_trades** — Once. Trades for those mints; replace or init trade feed.
 6. **snapshot_tickers** — Once. Current state of all active tokens. **Use this to initially populate the UI to prevent blank screens.**
-7. Live stream: `token_launch`, `token_security_update`, `trade`, `migration`, `ohclv`.
+7. Live stream: `token_launch`, `trade`, `migration`, `ohclv`.
 
 Snapshots are hydrated from Redis on startup. Redis persistence ensures consistent state (volume, price) across server restarts.
 

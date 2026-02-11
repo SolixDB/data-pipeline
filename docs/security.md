@@ -1,8 +1,8 @@
-# security.rs — Rug Check (mint security)
+# security.rs — Mint security (Rug Check)
 
 **Source:** `src/security.rs`
 
-This module fetches and parses SPL mint account data from a Solana JSON‑RPC endpoint and derives simple Rug Check flags. Results are attached to launches and sent to clients.
+This module fetches and parses SPL mint account data from a Solana JSON‑RPC endpoint and derives simple Rug Check flags. **The main pipeline does not currently call it;** the handler no longer runs Rug Check or sends `token_security_update`. The types and helpers remain for optional use (e.g. other binaries or future re‑enablement).
 
 ---
 
@@ -31,12 +31,7 @@ pub struct MintSecurity {
 - `mint_authority_renounced` – `true` when `mint_authority` is `None`.
 - `freeze_authority_renounced` – `true` when `freeze_authority` is `None`.
 
-Frontends receive this via:
-
-- `TokenLaunchPayload.security: Option<MintSecurity>`
-- `TokenSecurityUpdate.security: MintSecurity`
-
-See [messages.md](messages.md) for wire details and [events.md](events.md) for how it is attached to `TokenLaunch`.
+`TokenLaunchPayload.security` is an `Option<MintSecurity>`; the pipeline currently leaves it `null`. See [messages.md](messages.md) and [events.md](events.md).
 
 ---
 
@@ -79,30 +74,5 @@ The main pipeline does **not** use this helper directly; instead it passes `RPC_
 
 ## Where Rug Check is used
 
-- **main.rs**
-  - Reads `RPC_URL` from the environment (optional) and passes it to `handle_stream_updates`.
-- **handler.rs**
-  - For each launch:
-    1. Builds and broadcasts `token_launch` **without** waiting on Rug Check.
-    2. Spawns a background task which:
-       - Calls `fetch_mint_security(rpc_url, mint)` with a 500ms timeout.
-       - If successful:
-         - Sets `launch.security = Some(MintSecurity)`.
-         - Broadcasts `token_security_update` on topic = `mint`.
-       - Irrespective of Rug Check success, continues with metrics + storage + Redis + known_mints.
-- **storage.rs**
-  - Stores the enriched `security` inside launches so snapshots include Rug Check state for reconnecting clients.
-
----
-
-## Frontend expectations
-
-- `TokenLaunchPayload.security` may be `null` on the first launch event.
-- A follow‑up `token_security_update` will arrive on the mint topic if Rug Check succeeded.
-- Snapshots (`snapshot_launches`) will typically contain `security` for older tokens.
-
-Recommended UX:
-
-- Treat `mint_authority_renounced` and `freeze_authority_renounced` as the primary Rug Check flags.
-- Show more detailed information (e.g. current authority pubkeys) on hover/tooltips.
+The pipeline **does not** currently call `fetch_mint_security` or send any security updates. `RPC_URL` is still read in main and passed to the handler (e.g. for metadata backfill); Rug Check is disabled. To re‑enable, you would call `fetch_mint_security` in the handler and optionally broadcast a security payload; the `TokenSecurityUpdate` message type has been removed, so any new design would need a new variant or a different channel.
 

@@ -39,18 +39,11 @@ pub struct TokenLaunchPayload {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TokenSecurityUpdate {
-    pub mint: String,
-    pub security: crate::security::MintSecurity,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", content = "data")]
 #[serde(rename_all = "snake_case")]
 pub enum ServerMessage {
     Connected(ConnectedPayload),
     TokenLaunch(TokenLaunchPayload),
-    TokenSecurityUpdate(TokenSecurityUpdate),
     Trade(crate::events::Trade),
     Migration(crate::events::Migration),
     SnapshotMigrated(Vec<crate::storage::MigratedEntry>),

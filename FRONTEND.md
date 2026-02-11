@@ -33,12 +33,12 @@ All HTTP responses are JSON. WebSocket frames are MessagePack `ServerMessage` va
    4. `snapshot_launches`
    5. `snapshot_trades`
    6. `snapshot_tickers`
-3. After snapshots, live messages stream: `token_launch`, `token_security_update`, `trade`, `migration`, `ohclv`.
+3. After snapshots, live messages stream: `token_launch`, `trade`, `migration`, `ohclv`.
 
 Frames are MessagePack; you should:
 
 - Decode as a tagged enum:
-  - `type: "connected" | "token_launch" | "token_security_update" | "trade" | "migration" | "ohclv" | "snapshot_*"`
+  - `type: "connected" | "token_launch" | "trade" | "migration" | "ohclv" | "snapshot_*"`
   - `data: { ... }` is the payload.
 
 See `docs/messages.md` for exact shapes; below is the minimal subset you usually care about.
@@ -68,7 +68,6 @@ Behaviour:
     - `token_launch` for that mint (token details / metadata)
     - `trade` for that mint
     - `migration` for that mint
-    - `token_security_update` for that mint
     - `ohclv` candles for that mint
   - `topic = "tickers"` → periodic **snapshot_tickers** with **accurate volume** (recalculated from trade history with a delay; see “Volume and market cap” below).
 
@@ -181,7 +180,7 @@ Use this payload as the single source of truth for token metadata (see “Token 
 - **Accounts:** `pump_accounts` (bonding curve PDAs etc.)
 - **Constants:** `pump_constants` (program IDs, token_decimals)
 - **Curve:** `initial_bonding_curve_state?` (virtual/real reserves at create)
-- **Security:** `security?` (usually `null` on first message; filled later via `token_security_update`)
+- **Security:** `security?` (currently always `null`; no live security updates are sent)
 - **Price / liquidity:** `price`, `market_cap`, `liquidity_sol` (derived from curve state; may be 0)
 - **Create-event fields (from Pump.fun CreateEvent):**
   - `txn_timestamp` (u64): create time in **milliseconds** (Unix). Use for “launched at” and sorting.
@@ -197,35 +196,7 @@ Use this to:
 - Pre‑fill transaction‑builder forms (PDAs and program IDs).
 - Display supply or “mayhem” indicator when present.
 
-### 4. `token_security_update`
-
-**Display:** Show this message in the UI for the token’s Rug Check / security section. When `type === "token_security_update"`, use `data.mint` to find the token and `data.security` as the source of truth for mint/freeze authority and supply. Example shape: `{ "type": "token_security_update", "data": { "mint": "<pubkey>", "security": { "mint_authority_renounced": true, "freeze_authority_renounced": true, ... } } }`.
-
-Payload:
-
-- `mint`
-- `security` (`MintSecurity`):
-  - `mint`
-  - `mint_authority?`
-  - `freeze_authority?`
-- `supply`, `decimals`, `is_initialized`
-- `mint_authority_renounced` (bool)
-- `freeze_authority_renounced` (bool)
-
-**Note (top holders %):** The pipeline does **not** send `top10_pct` and does not expect the UI to compute it on every trade. If you want “top holders %”, compute it on-demand from a dedicated holder indexer/RPC call and cache it (detail page only), or omit it entirely.
-
-Semantics:
-
-- Sent **once per mint** when Rug Check successfully reads the on‑chain SPL mint.
-- Delivered on topic = `mint`.
-- `token_launch.security` may still be `null` when this arrives; treat this as the source of truth for security in the live session.
-
-**Recommended UX:**
-
-- Show obvious “mint/freeze authority still present” vs “fully renounced”.
-- You **do not** need to call RPC for this; it is done once in the pipeline.
-
-### 5. `trade`
+### 4. `trade`
 
 Key fields:
 
@@ -251,7 +222,7 @@ Use this to:
 - Stream the trade feed.
 - Update per‑token cards/rows in near‑real‑time (price, volume, tx count).
 
-### 6. `migration`
+### 5. `migration`
 
 **Order of messages:** For each migration the pipeline sends a **`token_launch`** update first (same shape as §3), with current `price`, `market_cap`, and `liquidity_sol` for that mint, then sends the **`migration`** message. Use the launch update so the token card shows correct price/mcap/liquidity and “migrated” state before you apply the migration.
 
@@ -273,7 +244,7 @@ Use this to:
 - Flip routing from bonding curve → AMM for a mint (`pool` is the AMM address).
 - Show “migrated” and avoid showing “bonding curve 100%” by handling the preceding `token_launch` update and then applying the `migration` event.
 
-### 7. `ohclv`
+### 6. `ohclv`
 
 Finalized 1‑minute candle:
 
@@ -352,7 +323,7 @@ Backed by ClickHouse OHLCV; frontends can use this for initial chart history and
   - [ ] Connect to `ws://host:WS_PORT`.
   - [ ] Decode MessagePack `ServerMessage` frames.
   - [ ] On connect, replace state from `snapshot_*` messages.
-  - [ ] Handle live `token_launch`, `token_security_update`, `trade`, `migration`, `ohclv`.
+  - [ ] Handle live `token_launch`, `trade`, `migration`, `ohclv`.
   - [ ] Use `token_launch` / `snapshot_launches` fields: `user`, `txn_timestamp`, `is_token_2022`, `token_total_supply?`, `token_program?`, `is_mayhem_mode?` where needed (see §3).
   - [ ] Use subscribe/unsubscribe messages to limit per‑mint traffic.
 
@@ -361,8 +332,7 @@ Backed by ClickHouse OHLCV; frontends can use this for initial chart history and
   - [ ] Apply streaming `ohclv` on top for live candles.
 
 - **Security**
-  - [ ] Show Rug Check state from `token_security_update.security`.
-  - [ ] Fall back to `TokenLaunchPayload.security` from snapshots for reconnects.
+  - [ ] Rug Check / mint security is not provided by the pipeline; omit or implement via your own RPC/API if needed.
 
-With this, you can build a full token list + detail view + charts + Rug Check without touching RPC directly.
+With this, you can build a full token list + detail view + charts without touching RPC directly.
 

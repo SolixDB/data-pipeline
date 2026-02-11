@@ -12,7 +12,7 @@ export GRPC_ENDPOINT="https://your-solana-grpc-endpoint.com"
 export REDIS_URL="redis://127.0.0.1:6379"
 export CLICKHOUSE_URL="http://127.0.0.1:8123"
 
-# Optional: Rug Check (mint security) — needs Solana JSON-RPC
+# Optional: Solana JSON-RPC (e.g. metadata backfill; Rug Check not currently used)
 export RPC_URL="https://api.mainnet-beta.solana.com"
 
 # Dev only: wipe state on start (do not use in prod)
@@ -40,7 +40,7 @@ Build a **release** binary (optimizations from `Cargo.toml`).
 |----------|---------|-------------|
 | `REDIS_URL` | — | Redis URL. Enables snapshot + cursor persistence across restarts; without it, snapshots are in-memory only. |
 | `CLICKHOUSE_URL` | — | ClickHouse HTTP URL. Enables storage (launches, trades, migrations, OHLCV, volume aggregates) and HTTP `/history` API. |
-| `RPC_URL` | — | Solana JSON-RPC URL for Rug Check (mint security). If unset, `token_security_update` is never sent; launches still work. `SOLANA_RPC_URL` is not used by this binary (reserved for helpers). |
+| `RPC_URL` | — | Solana JSON-RPC URL (e.g. metadata backfill). Rug Check is not currently run; no security updates are sent. `SOLANA_RPC_URL` is not used by this binary (reserved for helpers). |
 | `GRPC_API_KEY` | — | Optional gRPC auth token (e.g. Helius, Triton). |
 | `HEALTH_PORT` | 5567 | HTTP API port (`/config`, `/symbols`, `/history`, `/health`). Set to `0` to disable (not recommended in prod). |
 | `WS_PORT` | 5566 | WebSocket server port. |
@@ -171,7 +171,7 @@ journalctl -u data-pipeline -f
 | `CLICKHOUSE_URL` | No | — | ClickHouse HTTP URL; enables storage + `/history`. |
 | `CLICKHOUSE_USER` | No | — | ClickHouse user. |
 | `CLICKHOUSE_PASSWORD` | No | — | ClickHouse password. |
-| `RPC_URL` | No | — | Solana JSON-RPC URL for Rug Check (mint security). |
+| `RPC_URL` | No | — | Solana JSON-RPC URL (e.g. metadata backfill). |
 | `RUST_LOG` | No | info | Log level. |
 | `WS_INITIAL_SNAPSHOT_LAUNCH_LIMIT` | No | 30 | Max launches in connect snapshot. |
 | `WS_INITIAL_SNAPSHOT_TRADE_LIMIT` | No | 1000 | Max trades in connect snapshot. |
