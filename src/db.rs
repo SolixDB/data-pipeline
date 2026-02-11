@@ -338,7 +338,7 @@ pub async fn ensure_trades_table(client: &Client) -> clickhouse::error::Result<(
             suggested_compute_unit_limit UInt32,
             received_at UInt64 CODEC(Delta, ZSTD(3)),
             sent_at UInt64 CODEC(Delta, ZSTD(3)),
-            txn_timestamp UInt64 CODEC(Delta, ZSTD(3)) DEFAULT 0
+            txn_timestamp UInt64 DEFAULT 0 CODEC(Delta, ZSTD(3))
         )
         ENGINE = ReplacingMergeTree(received_at)
         PARTITION BY toYYYYMM(toDateTime(received_at / 1000000))

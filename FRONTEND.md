@@ -108,19 +108,29 @@ Use only for logging / debugging.
 
 ### 3. `token_launch`
 
-Payload (`TokenLaunchPayload`):
+Payload (`TokenLaunchPayload`). Same shape is used for **live** `token_launch` and for **snapshot_launches** on connect.
 
-- Identity: `signature`, `slot`, `mint`
-- Display: `name`, `symbol`, `uri`, `creator`
-- Accounts: `pump_accounts` (bonding curve PDAs etc.)
-- Constants: `pump_constants` (program IDs, token_decimals)
-- Curve: `initial_bonding_curve_state?`
-- Security: `security?` (usually `null` on this first message)
+- **Identity:** `signature`, `slot`, `mint`
+- **Display:** `name`, `symbol`, `uri`, `creator`
+- **Creator vs user:** `creator` (token creator); `user` (wallet that performed the create; may equal creator). Use `user` for “who launched” when you need the signer.
+- **Accounts:** `pump_accounts` (bonding curve PDAs etc.)
+- **Constants:** `pump_constants` (program IDs, token_decimals)
+- **Curve:** `initial_bonding_curve_state?` (virtual/real reserves at create)
+- **Security:** `security?` (usually `null` on first message; filled later via `token_security_update`)
+- **Price / liquidity:** `price`, `market_cap`, `liquidity_sol` (derived from curve state; may be 0)
+- **Create-event fields (from Pump.fun CreateEvent):**
+  - `txn_timestamp` (u64): create time in **milliseconds** (Unix). Use for “launched at” and sorting.
+  - `is_token_2022` (bool): `true` if the token was created with the Token-2022 program.
+  - `token_program?` (string): token program pubkey (e.g. `TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA` vs Token-2022). Omitted when not decoded.
+  - `token_total_supply?` (u64): total supply in **base units** (raw, same as SPL mint supply). Omitted when not decoded.
+  - `is_mayhem_mode?` (bool): Pump.fun “mayhem” mode flag. Omitted when not decoded.
 
 Use this to:
 
 - Add a row to the “new tokens” list.
-- Pre‑fill any transaction‑builder forms (you get PDAs and program IDs).
+- Show “launched at” using `txn_timestamp` and “Token-2022” badge using `is_token_2022` (or `token_program`).
+- Pre‑fill transaction‑builder forms (PDAs and program IDs).
+- Display supply or “mayhem” indicator when present.
 
 ### 4. `token_security_update`
 
@@ -271,6 +281,7 @@ Backed by ClickHouse OHLCV; frontends can use this for initial chart history and
   - [ ] Decode MessagePack `ServerMessage` frames.
   - [ ] On connect, replace state from `snapshot_*` messages.
   - [ ] Handle live `token_launch`, `token_security_update`, `trade`, `migration`, `ohclv`.
+  - [ ] Use `token_launch` / `snapshot_launches` fields: `user`, `txn_timestamp`, `is_token_2022`, `token_total_supply?`, `token_program?`, `is_mayhem_mode?` where needed (see §3).
   - [ ] Use subscribe/unsubscribe messages to limit per‑mint traffic.
 
 - **Charts**
