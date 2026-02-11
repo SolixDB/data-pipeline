@@ -644,8 +644,12 @@ async fn handle_transaction(
         debug!("{} | clients={}", log_msg, ws_server.client_count());
     }
 
+    // Only send migrations for mints we've sent a launch for (same rule as trades).
     let migrations = multi_parser::parse_migration_events(&instructions, parser_map, received_at);
     for mut migration in migrations {
+        if !known_mints.read().await.contains(&migration.mint) {
+            continue;
+        }
         if let Some(state_lock) = snapshot_state {
             let mut w = state_lock.write().await;
             let token_state = w.tickers.entry(migration.mint.clone())

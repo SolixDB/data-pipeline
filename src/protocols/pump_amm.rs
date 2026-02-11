@@ -1,7 +1,12 @@
 use yellowstone_vixen_core::instruction::InstructionUpdate;
-use crate::events::{Trade, TradeDirection};
+use crate::events::{Migration, Trade, TradeDirection};
 
 const AMM_EVENT_MIN_SIZE: usize = 144 + 32;
+
+/// Anchor event discriminator: first 8 bytes of sha256("event:CreatePoolEvent").
+const CREATE_POOL_EVENT_DISCRIMINATOR: [u8; 8] = [0xb1, 0x31, 0x0c, 0xd2, 0xa0, 0x76, 0xa7, 0x74];
+/// createPoolEvent min size: discriminator(8) + timestamp(8) + index(2) + creator(32) + baseMint(32) + quoteMint(32) + decimals(2) + 6*u64(48) + poolBump(1) + pool(32).
+const CREATE_POOL_EVENT_MIN_SIZE: usize = 8 + 8 + 2 + 32 + 32 + 32 + 2 + 48 + 1 + 32;
 const BUY_TOKEN_OFF: usize = 8;
 const BUY_SOL_OFF: usize = 56;
 const BUY_POOL_BASE_OFF: usize = 40;
@@ -32,6 +37,52 @@ pub fn has_buy_in_logs(ix: &InstructionUpdate) -> bool {
 
 pub fn has_sell_in_logs(ix: &InstructionUpdate) -> bool {
     ix.shared.log_messages.iter().any(|l| l.contains("Instruction: Sell"))
+}
+
+pub fn has_create_pool_in_logs(ix: &InstructionUpdate) -> bool {
+    ix.shared
+        .log_messages
+        .iter()
+        .any(|l| l.contains("Instruction: CreatePool"))
+}
+
+/// Decode createPoolEvent (pump_amm) into Migration. bonding_curve left empty (migration is from AMM side).
+fn decode_create_pool_event(
+    data: &[u8],
+    signature: &str,
+    slot: u64,
+    received_at: u64,
+) -> Option<Migration> {
+    if data.len() < CREATE_POOL_EVENT_MIN_SIZE {
+        return None;
+    }
+    let payload = &data[8..];
+    let timestamp_sec = i64::from_le_bytes(payload[0..8].try_into().ok()?) as u64;
+    let txn_timestamp = if (1577836800..=2524608000).contains(&timestamp_sec) {
+        timestamp_sec * 1000
+    } else {
+        received_at / 1000
+    };
+    let creator = bs58::encode(&payload[10..42]).into_string();
+    let base_mint = bs58::encode(&payload[42..74]).into_string();
+    let base_amount_in = u64::from_le_bytes(payload[108..116].try_into().ok()?);
+    let quote_amount_in = u64::from_le_bytes(payload[116..124].try_into().ok()?);
+    let pool = bs58::encode(&payload[165..197]).into_string();
+
+    Some(Migration {
+        signature: signature.to_string(),
+        slot,
+        mint: base_mint,
+        user: creator,
+        bonding_curve: String::new(),
+        pool,
+        token_amount: base_amount_in,
+        sol_amount: quote_amount_in,
+        fee: 0,
+        txn_timestamp,
+        received_at,
+        sent_at: 0,
+    })
 }
 
 fn decode_buy_event(
@@ -303,6 +354,65 @@ pub fn parse_amm_trade_events(ix: &InstructionUpdate, received_at: u64) -> Vec<T
                 break;
             }
         }
+    }
+    out
+}
+
+/// Parse migration (Create Pool) from pump_amm: 1) createPoolEvent from logs, 2) Geyser createPool instruction accounts.
+pub fn parse_migration_events_from_amm(
+    ix: &InstructionUpdate,
+    received_at: u64,
+) -> Vec<Migration> {
+    use base64::Engine;
+    let decoder = base64::engine::general_purpose::STANDARD;
+    let signature = bs58::encode(ix.shared.signature.as_slice()).into_string();
+    let mut out = Vec::new();
+
+    // 1. Event / logs — createPoolEvent in program logs.
+    for log in &ix.shared.log_messages {
+        let data_str = match program_data_payload(log) {
+            Some(s) => s,
+            None => continue,
+        };
+        let data = match decoder.decode(data_str) {
+            Ok(d) => d,
+            Err(_) => continue,
+        };
+        if data.len() < CREATE_POOL_EVENT_MIN_SIZE {
+            continue;
+        }
+        let disc = &data[0..8];
+        if disc != CREATE_POOL_EVENT_DISCRIMINATOR {
+            continue;
+        }
+        if let Some(migration) =
+            decode_create_pool_event(&data, &signature, ix.shared.slot, received_at)
+        {
+            out.push(migration);
+            return out;
+        }
+    }
+
+    // 2. Geyser instruction (fallback when event didn't decode) — createPool accounts: pool=0, creator=2, baseMint=3.
+    if has_create_pool_in_logs(ix) && ix.accounts.len() >= 4 {
+        let pool = bs58::encode(&ix.accounts[0].0).into_string();
+        let creator = bs58::encode(&ix.accounts[2].0).into_string();
+        let base_mint = bs58::encode(&ix.accounts[3].0).into_string();
+        let txn_timestamp = received_at / 1000;
+        out.push(Migration {
+            signature: signature.clone(),
+            slot: ix.shared.slot,
+            mint: base_mint,
+            user: creator,
+            bonding_curve: String::new(),
+            pool,
+            token_amount: 0,
+            sol_amount: 0,
+            fee: 0,
+            txn_timestamp,
+            received_at,
+            sent_at: 0,
+        });
     }
     out
 }

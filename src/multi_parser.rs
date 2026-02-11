@@ -106,15 +106,30 @@ pub fn parse_migration_events(
     let mut flat = Vec::new();
     flatten_instructions(instructions, &mut flat);
     let mut out = Vec::new();
+    let mut seen_mints = HashSet::new();
     for ix in flat {
         let program_bytes: &[u8] = ix.program.as_ref();
-        if parser_map.get(program_bytes) != Some(&"pump_fun") {
+        // 1. pump_fun: Migrate event (logs)
+        if parser_map.get(program_bytes) == Some(&"pump_fun") {
+            if protocols::pump_fun::has_migrate_in_logs(ix) {
+                for m in protocols::pump_fun::parse_migration_events(ix, received_at) {
+                    if seen_mints.insert(m.mint.clone()) {
+                        out.push(m);
+                    }
+                }
+            }
             continue;
         }
-        if !protocols::pump_fun::has_migrate_in_logs(ix) {
-            continue;
+        // 2. pump_amm: Create Pool event + Geyser instruction fallback (same tx may have both)
+        if parser_map.get(program_bytes) == Some(&"pump_amm") {
+            if protocols::pump_amm::has_create_pool_in_logs(ix) {
+                for m in protocols::pump_amm::parse_migration_events_from_amm(ix, received_at) {
+                    if seen_mints.insert(m.mint.clone()) {
+                        out.push(m);
+                    }
+                }
+            }
         }
-        out.extend(protocols::pump_fun::parse_migration_events(ix, received_at));
     }
     out
 }
