@@ -298,22 +298,55 @@ async fn handle_connection(
                         break;
                     }
                     Some(Ok(Message::Text(text))) => {
-                         if let Ok(client_msg) = serde_json::from_str::<crate::messages::ClientMessage>(&text) {
+                        if let Ok(client_msg) =
+                            serde_json::from_str::<crate::messages::ClientMessage>(&text)
+                        {
                             match client_msg {
                                 crate::messages::ClientMessage::Subscribe(topics) => {
-                                    for t in topics {
-                                        subscriptions.insert(t);
+                                    for topic in topics {
+                                        let is_new = subscriptions.insert(topic.clone());
+
+                                        // On first subscribe to a mint-like topic, proactively send the latest
+                                        // TokenLaunchPayload so the client has token details before any trades.
+                                        // We skip special aggregate topics like \"launches\" and \"tickers\".
+                                        if is_new && topic != \"launches\" && topic != \"tickers\" {
+                                            if let Some(ref state_lock) = server.snapshot_state {
+                                                let launch_opt = {
+                                                    let snap = state_lock.read().await;
+                                                    snap.latest_launch_by_mint
+                                                        .get(&topic)
+                                                        .cloned()
+                                                };
+                                                if let Some(payload) = launch_opt {
+                                                    if let Ok(bytes) = rmp_serde::to_vec_named(
+                                                        &ServerMessage::TokenLaunch(payload),
+                                                    ) {
+                                                        let _ = ws_sender
+                                                            .send(Message::Binary(bytes.into()))
+                                                            .await;
+                                                    }
+                                                }
+                                            }
+                                        }
                                     }
-                                    debug!("Client {} subscribed to {} topics", client_id, subscriptions.len());
+                                    debug!(
+                                        \"Client {} subscribed to {} topics\",
+                                        client_id,
+                                        subscriptions.len()
+                                    );
                                 }
                                 crate::messages::ClientMessage::Unsubscribe(topics) => {
                                     for t in topics {
                                         subscriptions.remove(&t);
                                     }
-                                    debug!("Client {} unsubscribed, remaining: {}", client_id, subscriptions.len());
+                                    debug!(
+                                        \"Client {} unsubscribed, remaining: {}\",
+                                        client_id,
+                                        subscriptions.len()
+                                    );
                                 }
                             }
-                         }
+                        }
                     }
                     Some(Err(_)) => {
                         break;
