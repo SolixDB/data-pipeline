@@ -1,0 +1,15 @@
+---
+description: Frontend must follow FRONTEND.md strictly when integrating with data-pipeline
+globs: FRONTEND.md
+alwaysApply: false
+---
+
+# Data-pipeline frontend contract
+
+When working on the **frontend** (or any client) that connects to this data-pipeline:
+
+1. **Use `FRONTEND.md` as the strict source of truth.** Read it before implementing or changing WebSocket/HTTP integration.
+2. **Change whatever is implemented** so the frontend matches the contract: endpoints, message format (envelope with `type`, `data`, `seq`), ACK (send `{"method":"ack","params":<seq>}` at least every 100 ms or every 20 messages), subscriptions, error handling, HTTP backfill (`/token`, `/tokens`), and the checklist in FRONTEND.md.
+3. **Do not deviate** from FRONTEND.md (e.g. do not skip ACK, assume a different envelope shape, or use undocumented fields/endpoints) unless the user explicitly requests a change and FRONTEND.md is updated.
+
+If the frontend code lives in another repo, still follow the contract in this repo's `FRONTEND.md` when implementing the client that talks to this pipeline.

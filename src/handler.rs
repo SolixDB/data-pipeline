@@ -55,7 +55,6 @@ pub async fn handle_stream_updates(
     snapshot_state: Option<Arc<RwLock<SnapshotState>>>,
     volume_cache: Arc<RwLock<HashMap<String, VolumeMetrics>>>,
     redis_client: Option<Arc<redis::Client>>,
-    rpc_url: Option<String>,
 ) -> anyhow::Result<()> {
     let mut last_ping = std::time::Instant::now();
     let ping_interval = std::time::Duration::from_secs(30);
@@ -151,7 +150,6 @@ pub async fn handle_stream_updates(
                                     known_mints.clone(),
                                     volume_cache.clone(),
                                     redis_client.clone(),
-                                    rpc_url.as_deref(),
                                     recent_sigs.clone(),
                                 )
                                 .await
@@ -248,11 +246,7 @@ pub async fn handle_stream_updates(
                     drop(r);
                     drop(cache);
                     if !tickers.is_empty() {
-                        if let Ok(bytes) =
-                            rmp_serde::to_vec_named(&ServerMessage::SnapshotTickers(tickers))
-                        {
-                            ws_server.broadcast("tickers".to_string(), bytes);
-                        }
+                        ws_server.broadcast_message("tickers".to_string(), ServerMessage::SnapshotTickers(tickers));
                     }
                 }
             }
@@ -277,7 +271,6 @@ async fn handle_transaction(
     known_mints: Arc<RwLock<HashSet<String>>>,
     volume_cache: Arc<RwLock<HashMap<String, VolumeMetrics>>>,
     redis_client: Option<Arc<redis::Client>>,
-    rpc_url: Option<&str>,
     recent_sigs: Arc<RwLock<HashMap<String, u64>>>,
 ) -> anyhow::Result<()> {
     if let Some(h) = health_state {
@@ -422,7 +415,6 @@ async fn handle_transaction(
             token_decimals: launch.token_decimals,
             initial_bonding_curve_state: launch.initial_bonding_curve_state,
             pump_constants: launch.pump_constants.clone(),
-            security: launch.security.clone(),
             price,
             market_cap,
             liquidity_sol,
@@ -435,10 +427,8 @@ async fn handle_transaction(
 
         // Send launch to frontend first. Broadcast on both "launches" and per-mint topic so
         // clients subscribed only to the mint still receive token metadata.
-        if let Ok(bytes) = rmp_serde::to_vec_named(&ServerMessage::TokenLaunch(payload.clone())) {
-            ws_server.broadcast("launches".to_string(), bytes.clone());
-            ws_server.broadcast(launch.mint.clone(), bytes);
-        }
+        ws_server.broadcast_message("launches".to_string(), ServerMessage::TokenLaunch(payload.clone()));
+        ws_server.broadcast_message(launch.mint.clone(), ServerMessage::TokenLaunch(payload.clone()));
         debug!("{} | clients={}", log_msg, ws_server.client_count());
 
         if let Some(ref state_lock) = snapshot_state {
@@ -454,86 +444,11 @@ async fn handle_transaction(
         let metrics_client_bg = metrics_client.clone();
         let storage_tx_bg = storage_tx.clone();
         let redis_client_bg = redis_client.clone();
-        let ws_server_bg = ws_server.clone();
-        let rpc_url_bg = rpc_url.map(|s| s.to_string());
         let mint_for_tracking_bg = mint_for_tracking.clone();
         let bonding_curve_for_tracking_bg = bonding_curve_for_tracking.clone();
-        let mut launch_bg = launch.clone();
-        let snapshot_state_bg = snapshot_state.clone();
-        let needs_rpc_metadata = launch_bg.symbol.is_empty() && launch_bg.uri.is_empty();
+        let launch_bg = launch.clone();
 
         tokio::spawn(async move {
-            // For PumpAMM direct CreatePool launches (no Pump.fun CreateEvent), best-effort fetch token metadata via RPC
-            // and then rebroadcast + persist an updated token_launch.
-            if needs_rpc_metadata {
-                if let Some(url) = rpc_url_bg.as_deref() {
-                    match tokio::time::timeout(
-                        std::time::Duration::from_millis(800),
-                        crate::token_metadata::fetch_metaplex_metadata(url, &launch_bg.mint),
-                    )
-                    .await
-                    {
-                        Ok(Ok(Some(meta))) => {
-                            if !meta.name.is_empty() {
-                                launch_bg.name = meta.name;
-                            }
-                            if !meta.symbol.is_empty() {
-                                launch_bg.symbol = meta.symbol;
-                            }
-                            if !meta.uri.is_empty() {
-                                launch_bg.uri = meta.uri;
-                            }
-
-                            if let Some(ref state_lock) = snapshot_state_bg {
-                                let mut w = state_lock.write().await;
-                                let (price, market_cap, liquidity_sol) = w.tickers
-                                    .get(&launch_bg.mint)
-                                    .map(|t| (t.price, t.market_cap, t.liquidity_sol))
-                                    .unwrap_or((0.0, 0.0, 0.0));
-                                let payload = TokenLaunchPayload {
-                                    signature: launch_bg.signature.clone(),
-                                    slot: launch_bg.slot,
-                                    mint: launch_bg.mint.clone(),
-                                    name: launch_bg.name.clone(),
-                                    symbol: launch_bg.symbol.clone(),
-                                    uri: launch_bg.uri.clone(),
-                                    creator: launch_bg.creator.clone(),
-                                    user: launch_bg.user.clone(),
-                                    pump_accounts: launch_bg.pump_accounts.clone(),
-                                    token_decimals: launch_bg.token_decimals,
-                                    initial_bonding_curve_state: launch_bg.initial_bonding_curve_state,
-                                    pump_constants: launch_bg.pump_constants.clone(),
-                                    security: launch_bg.security.clone(),
-                                    price,
-                                    market_cap,
-                                    liquidity_sol,
-                                    txn_timestamp: launch_bg.txn_timestamp,
-                                    is_token_2022: launch_bg.is_token_2022,
-                                    token_total_supply: launch_bg.token_total_supply,
-                                    token_program: launch_bg.token_program.clone(),
-                                    is_mayhem_mode: launch_bg.is_mayhem_mode,
-                                };
-                                w.latest_launch_by_mint.insert(launch_bg.mint.clone(), payload.clone());
-                                if let Ok(bytes) =
-                                    rmp_serde::to_vec_named(&ServerMessage::TokenLaunch(payload))
-                                {
-                                    ws_server_bg.broadcast("launches".to_string(), bytes.clone());
-                                    ws_server_bg.broadcast(launch_bg.mint.clone(), bytes);
-                                }
-                            }
-
-                            // Persist updated metadata (latest row wins in /token).
-                            let _ = storage_tx_bg
-                                .send(StorageMessage::TokenLaunch(launch_bg.clone()))
-                                .await;
-                        }
-                        Ok(Ok(None)) => {}
-                        Ok(Err(e)) => debug!("Metadata fetch failed for {}: {}", launch_bg.mint, e),
-                        Err(_) => debug!("Metadata fetch timeout for {}", launch_bg.mint),
-                    }
-                }
-            }
-
             db::update_metrics_aggregates_optional(
                 metrics_client_bg.as_deref(),
                 grpc_ms,
@@ -725,9 +640,7 @@ async fn handle_transaction(
         }
 
         if let Some(c) = finalized_candle {
-            if let Ok(bytes) = rmp_serde::to_vec_named(&ServerMessage::Ohclv(c.clone())) {
-                ws_server.broadcast(c.mint.clone(), bytes);
-            }
+            ws_server.broadcast_message(c.mint.clone(), ServerMessage::Ohclv(c.clone()));
             if let Err(e) = storage_tx.send(StorageMessage::Ohclv(c)).await {
                  warn!("Failed to send OHLCV to storage: {:?}", e);
             }
@@ -761,10 +674,8 @@ async fn handle_transaction(
                     }
                 }
                 if let Some(payload) = launch_payload_opt {
-                    if let Ok(bytes) = rmp_serde::to_vec_named(&ServerMessage::TokenLaunch(payload)) {
-                        ws_server.broadcast("launches".to_string(), bytes.clone());
-                        ws_server.broadcast(m.mint.clone(), bytes);
-                    }
+                    ws_server.broadcast_message("launches".to_string(), ServerMessage::TokenLaunch(payload.clone()));
+                    ws_server.broadcast_message(m.mint.clone(), ServerMessage::TokenLaunch(payload));
                 }
             }
 
@@ -775,9 +686,7 @@ async fn handle_transaction(
                 &m.mint[..m.mint.len().min(8)],
                 &m.pool[..m.pool.len().min(8)]
             );
-             if let Ok(bytes) = rmp_serde::to_vec_named(&ServerMessage::Migration(m.clone())) {
-                ws_server.broadcast(m.mint.clone(), bytes);
-            }
+            ws_server.broadcast_message(m.mint.clone(), ServerMessage::Migration(m.clone()));
             storage_tx.send(StorageMessage::Migration(m)).await
                 .map_err(|_| anyhow::anyhow!("Storage channel closed"))?;
             debug!("{} | clients={}", log_msg, ws_server.client_count());
@@ -813,9 +722,7 @@ async fn handle_transaction(
             );
         }
         // #endregion
-        if let Ok(bytes) = rmp_serde::to_vec_named(&ServerMessage::Trade(trade.clone())) {
-            ws_server.broadcast(trade.mint.clone(), bytes);
-        }
+        ws_server.broadcast_message(trade.mint.clone(), ServerMessage::Trade(trade.clone()));
         storage_tx.send(StorageMessage::Trade(trade)).await
             .map_err(|_| anyhow::anyhow!("Storage channel closed"))?;
         debug!("{} | clients={}", log_msg, ws_server.client_count());
@@ -876,10 +783,8 @@ async fn handle_transaction(
                     .migrated_to_pool = Some(migration.pool.clone());
             }
             if let Some(payload) = launch_payload_opt {
-                if let Ok(bytes) = rmp_serde::to_vec_named(&ServerMessage::TokenLaunch(payload)) {
-                    ws_server.broadcast("launches".to_string(), bytes.clone());
-                    ws_server.broadcast(migration.mint.clone(), bytes);
-                }
+                ws_server.broadcast_message("launches".to_string(), ServerMessage::TokenLaunch(payload.clone()));
+                ws_server.broadcast_message(migration.mint.clone(), ServerMessage::TokenLaunch(payload));
             }
         }
 
@@ -891,9 +796,7 @@ async fn handle_transaction(
             &migration.pool[..migration.pool.len().min(8)]
         );
         migration.sent_at = unix_timestamp_micros();
-        if let Ok(bytes) = rmp_serde::to_vec_named(&ServerMessage::Migration(migration.clone())) {
-            ws_server.broadcast(migration.mint.clone(), bytes);
-        }
+        ws_server.broadcast_message(migration.mint.clone(), ServerMessage::Migration(migration.clone()));
         storage_tx.send(StorageMessage::Migration(migration)).await
             .map_err(|_| anyhow::anyhow!("Storage channel closed"))?;
         debug!("{} | clients={}", log_msg, ws_server.client_count());

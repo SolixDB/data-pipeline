@@ -18,8 +18,6 @@ pub struct TokenLaunchPayload {
     pub initial_bonding_curve_state: Option<crate::events::BondingCurveState>,
     #[serde(default)]
     pub pump_constants: crate::events::PumpProtocolConstants,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub security: Option<crate::security::MintSecurity>,
     #[serde(default)]
     pub price: f64,
     #[serde(default)]
@@ -38,11 +36,22 @@ pub struct TokenLaunchPayload {
     pub is_mayhem_mode: Option<bool>,
 }
 
+/// Envelope for every WebSocket message so clients can detect gaps (seq jumps).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ServerMessageEnvelope {
+    #[serde(flatten)]
+    pub message: ServerMessage,
+    /// Monotonic sequence number per connection; if it jumps by more than 1, client should treat as gap and recover (reconnect + snapshot or backfill).
+    pub seq: u64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", content = "data")]
 #[serde(rename_all = "snake_case")]
 pub enum ServerMessage {
     Connected(ConnectedPayload),
+    /// Sent once before snapshot_* on connect; client can store as_of_slot for gap detection.
+    SnapshotInfo(SnapshotInfoPayload),
     TokenLaunch(TokenLaunchPayload),
     Trade(crate::events::Trade),
     Migration(crate::events::Migration),
@@ -52,6 +61,14 @@ pub enum ServerMessage {
     SnapshotTrades(Vec<crate::events::Trade>),
     SnapshotTickers(Vec<TokenTicker>),
     Ohclv(crate::events::Ohclv),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SnapshotInfoPayload {
+    /// Snapshot state is as of this slot; any later message with slot > as_of_slot is a delta.
+    pub as_of_slot: u64,
+    /// Sequence number of this snapshot batch (first seq in the snapshot stream).
+    pub snapshot_seq: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -86,6 +103,9 @@ impl From<&crate::storage::TokenState> for TokenTicker {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConnectedPayload {
     pub client_id: u64,
+    /// Recommended topics for list view: subscribe to these to get launches and tickers without full trade firehose (reduces drop risk).
+    #[serde(default)]
+    pub recommended_topics: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -94,4 +114,6 @@ pub struct ConnectedPayload {
 pub enum ClientMessage {
     Subscribe(Vec<String>),
     Unsubscribe(Vec<String>),
+    /// Cumulative ACK: client has received all messages up to and including this seq. Server uses this for selective repeat (retransmit only to sockets that didn't ACK).
+    Ack(u64),
 }

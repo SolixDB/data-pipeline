@@ -10,8 +10,6 @@ mod multi_parser;
 mod storage;
 mod ws_server;
 mod api;
-mod security;
-mod token_metadata;
 
 use anyhow::Context;
 use backoff::{future, ExponentialBackoff, Error as BackoffError};
@@ -239,7 +237,7 @@ async fn main() -> anyhow::Result<()> {
                 .context("subscribe")?;
 
             tokio::select! {
-                result = handle_stream_updates(stream, subscribe_tx, (*config).clone(), ws_server.clone(), parser_map.clone(), metrics_client.clone(), storage_tx.clone(), Some(health_state.clone()), Some(snapshot_state.clone()), volume_cache.clone(), redis_client_retry.clone(), std::env::var("RPC_URL").ok()) => {
+                result = handle_stream_updates(stream, subscribe_tx, (*config).clone(), ws_server.clone(), parser_map.clone(), metrics_client.clone(), storage_tx.clone(), Some(health_state.clone()), Some(snapshot_state.clone()), volume_cache.clone(), redis_client_retry.clone()) => {
                     result.map_err(|e| {
                         error!("Stream: {}", e);
                         BackoffError::transient(e)

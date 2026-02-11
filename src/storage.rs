@@ -616,7 +616,6 @@ pub fn spawn_storage_worker(
                         token_decimals: launch.token_decimals,
                         initial_bonding_curve_state: launch.initial_bonding_curve_state,
                         pump_constants: launch.pump_constants.clone(),
-                        security: launch.security.clone(),
                         price,
                         market_cap,
                         liquidity_sol,

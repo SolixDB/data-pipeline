@@ -19,14 +19,8 @@ pub struct Config {
     pub clear_redis: bool,
     pub skip_clickhouse: bool,
     pub clear_clickhouse_only: bool,
-    #[allow(dead_code)]
-    pub health_port: u16,
-    #[allow(dead_code)]
-    pub health_grpc_max_age_secs: u64,
     pub snapshot_launch_limit: usize,
     pub snapshot_trade_limit: usize,
-    #[allow(dead_code)]
-    pub cursor_overlap_slots: u64,
 }
 
 impl Default for Config {
@@ -60,26 +54,14 @@ impl Default for Config {
                 .ok()
                 .map(|s| matches!(s.to_lowercase().as_str(), "1" | "true" | "yes"))
                 .unwrap_or(false),
-            health_port: env::var("HEALTH_PORT")
-                .ok()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(5567),
-            health_grpc_max_age_secs: env::var("HEALTH_GRPC_MAX_AGE_SECS")
-                .ok()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(120),
             snapshot_launch_limit: env::var("WS_INITIAL_SNAPSHOT_LAUNCH_LIMIT")
                 .ok()
                 .and_then(|s| s.parse().ok())
-                .unwrap_or(30),
+                .unwrap_or(50),
             snapshot_trade_limit: env::var("WS_INITIAL_SNAPSHOT_TRADE_LIMIT")
                 .ok()
                 .and_then(|s| s.parse().ok())
-                .unwrap_or(1000),
-            cursor_overlap_slots: env::var("CURSOR_OVERLAP_SLOTS")
-                .ok()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(2),
+                .unwrap_or(1500),
         }
     }
 }

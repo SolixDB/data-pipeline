@@ -8,9 +8,13 @@ Types sent over the WebSocket are `ServerMessage` values encoded as MessagePack.
 
 ## Encoding
 
-- **Format:** MessagePack (binary), via `rmp_serde::to_vec_named(&ServerMessage::...)`.
-- **Shape:** Serde tag `type` (snake_case variant) and content `data` (payload).
-- **Per frame:** Exactly one `ServerMessage` per binary frame.
+- **Format:** MessagePack (binary). Each binary frame is a **ServerMessageEnvelope**: `{ type, data, seq }`.
+- **Shape:** Serde tag `type` (snake_case variant), content `data` (payload), and **seq** (u64, monotonic per stream).
+- **Per frame:** Exactly one envelope per binary frame. Use `seq` to detect gaps and to send cumulative ACKs for selective repeat.
+
+## ServerMessageEnvelope and selective repeat
+
+Every message is wrapped as `ServerMessageEnvelope { message, seq }`. The server keeps a replay buffer of recent messages. If the client sends **Ack(seq)** (cumulative: “I have everything up to seq”), the server tracks per-client `last_acked` and periodically retransmits only the missing sequence block to clients that haven’t ACKed—so no reconnect is needed to repair drops.
 
 ---
 
@@ -31,11 +35,18 @@ Snapshots are sent once on connect; live variants stream until the connection cl
 
 ---
 
+## ClientMessage (client → server, JSON text frames)
+
+- `Subscribe(Vec<String>)` — `{ "method": "subscribe", "params": ["launches", "<MINT>", ...] }`
+- `Unsubscribe(Vec<String>)` — `{ "method": "unsubscribe", "params": ["<MINT>"] }`
+- **`Ack(u64)`** — `{ "method": "ack", "params": <seq> }`. Cumulative ACK: client has received all messages up to and including this seq. Server uses this for selective repeat (retransmits only to sockets that didn’t ACK).
+
 ## ConnectedPayload
 
 | Field | Type | Meaning |
 |-------|------|--------|
 | client_id | u64 | Unique id for this connection (monotonic). Logging/correlation only. |
+| recommended_topics | Vec<String> | Optional. Server recommends e.g. `["launches", "tickers"]` for list view. |
 
 Sent by ws_server in handle_connection immediately after accept. See [ws_server.md](ws_server.md).
 
@@ -113,4 +124,4 @@ Snapshots are hydrated from Redis on startup. Redis persistence ensures consiste
 - **trade** — For each Buy/Sell (Pump.fun or Pump AMM); order is stream order.
 - **migration** — For each Migrate; order is stream order.
 
-No acks or client-to-server message types in this codebase; server only pushes.
+Clients send **Ack(seq)** (and Subscribe/Unsubscribe) as JSON text frames; server pushes binary envelopes and uses ACKs for selective repeat.

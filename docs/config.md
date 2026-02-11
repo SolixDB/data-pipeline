@@ -26,9 +26,8 @@ Config is loaded from the environment and validated at startup. This doc lists e
 | `clear_clickhouse_only` | `bool` | `CLEAR_CLICKHOUSE_ONLY` | When true (1/true/yes), connect to ClickHouse, drop and recreate tables, then set client to None for the rest of the run (no further writes). Requires CLICKHOUSE_URL. |
 | `health_port` | `u16` | `HEALTH_PORT` | Reserved; currently HTTP API port is read directly from `HEALTH_PORT` in `main.rs`. |
 | `health_grpc_max_age_secs` | `u64` | `HEALTH_GRPC_MAX_AGE_SECS` | Reserved for future “strict health” semantics. Not used in the current binary. |
-| `snapshot_launch_limit` | `usize` | `WS_INITIAL_SNAPSHOT_LAUNCH_LIMIT` | Max token launches in WS connect snapshot. Default 30. |
-| `snapshot_trade_limit` | `usize` | `WS_INITIAL_SNAPSHOT_TRADE_LIMIT` | Max trades (for those mints) in WS connect snapshot. Default 1000. |
-| `cursor_overlap_slots` | `u64` | `CURSOR_OVERLAP_SLOTS` | How many slots to rewind when resuming from a stored cursor. Default 2. |
+| `snapshot_launch_limit` | `usize` | `WS_INITIAL_SNAPSHOT_LAUNCH_LIMIT` | Max token launches in WS connect snapshot. Default 50. Clamped 1–10_000 in storage. Use a higher value so reconnecting clients get more recent launches and recover from dropped messages. |
+| `snapshot_trade_limit` | `usize` | `WS_INITIAL_SNAPSHOT_TRADE_LIMIT` | Max trades (for those mints) in WS connect snapshot. Default 1500. Clamped 1–50_000 in storage. |
 
 ---
 
@@ -58,8 +57,9 @@ Returns `anyhow::Result<()>`. Called in main before starting the server; invalid
 
 ## Where config is used
 
-- **main**: validation; WS_PORT from env separately (not in Config); backoff built from reconnect_*; creates health_state and spawns health server when health_port != 0; passes config clone and health_state into retry closure; uses redis_url for Redis client and storage worker; uses clickhouse_* and clear/skip flags for ClickHouse client lifecycle; passes snapshot_launch_limit and snapshot_trade_limit to spawn_storage_worker.
+- **main**: validation; WS_PORT and HEALTH_PORT from env separately (not in Config); backoff built from reconnect_*; creates health_state; passes config clone and health_state into retry closure; uses redis_url for Redis client and storage worker; uses clickhouse_* and clear/skip flags for ClickHouse client lifecycle; passes snapshot_launch_limit and snapshot_trade_limit to spawn_storage_worker.
+- **ws_server**: `WS_SEND_SNAPSHOT_ON_CONNECT` (via `WsConfig::default()`) controls whether to send snapshot_* on each client connect. Default true. When false, clients only get the live stream.
 - **client**: endpoint, api_token, max_decoding_message_size, and endpoint scheme (https → TLS). See [client.md](client.md).
 - **handler**: received as argument; used only for `send_ping` (commitment and ping id). See [handler.md](handler.md).
 
-WS_PORT, WS_MAX_CONNECTIONS, WS_MAX_LAG_DROP are read in ws_server (WsConfig::default()) and in main (for port only); they are not fields of Config.
+**WebSocket (WsConfig, not in Config):** `WS_PORT`, `WS_MAX_LAG_DROP` are read in ws_server (`WsConfig::default()`) and in main (for port only). `WS_SEND_SNAPSHOT_ON_CONNECT` (default: true; 0/false/no to disable) controls whether each connecting client receives snapshot_* (launches, trades, tickers, migrated, soon_migrating) on connect. When in-memory snapshot is missing (empty), the server falls back to Redis if `REDIS_URL` is set.

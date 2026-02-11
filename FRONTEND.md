@@ -1,5 +1,11 @@
 # Frontend integration guide
 
+**For frontend agents (AI/automation):** This document is the **strict contract** for the client that connects to the data-pipeline. When implementing or changing the frontend (WebSocket client, HTTP API usage, message handling, ACK, subscriptions, backfill, or any behavior described here):
+
+1. **Follow this document strictly.** Treat it as the source of truth.
+2. **Change whatever is implemented** in the frontend so that it matches what is specified here (endpoints, message format, envelope with `seq`, ACK format and frequency, subscription semantics, error handling, HTTP backfill, checklist, etc.).
+3. **Do not deviate** from the contract (e.g. do not skip ACK, use a different envelope shape, or assume fields or endpoints not described here) unless the user explicitly asks for a change and the contract is updated.
+
 This document is for the frontend engineer wiring the UI into the data‑pipeline. It focuses only on what you need to connect, consume data, and build features quickly.
 
 ---
@@ -14,6 +20,8 @@ This document is for the frontend engineer wiring the UI into the data‑pipelin
   - Endpoints:
     - `GET /config` – TradingView UDF config.
     - `GET /symbols?symbol=<MINT>` – symbol metadata.
+    - `GET /token?mint=<MINT>` – token metadata (name, symbol, uri, creator). Use when WS missed `token_launch`.
+    - `GET /tokens?mints=<MINT1>,<MINT2>,...` – batch token metadata (max 100 mints). Use to backfill many mints after reconnect.
     - `GET /history?symbol=<MINT>&resolution=<RES>&from=<TS>&to=<TS>` – OHLCV candles.
     - `GET /health` and `GET /` – simple health (200 = OK).
 
@@ -28,18 +36,27 @@ All HTTP responses are JSON. WebSocket frames are MessagePack `ServerMessage` va
 1. Open `ws://<host>:WS_PORT`.
 2. Server immediately sends:
    1. `connected`
-   2. `snapshot_migrated`
-   3. `snapshot_soon_migrating`
-   4. `snapshot_launches`
-   5. `snapshot_trades`
-   6. `snapshot_tickers`
-3. After snapshots, live messages stream: `token_launch`, `trade`, `migration`, `ohclv`.
+   2. Optionally (if the server has `WS_SEND_SNAPSHOT_ON_CONNECT` enabled, which is the default): `snapshot_migrated`, `snapshot_soon_migrating`, `snapshot_launches`, `snapshot_trades`, `snapshot_tickers`. If snapshots are disabled, you only get `connected` and then the live stream.
+3. After that, live messages stream: `token_launch`, `trade`, `migration`, `ohclv`.
 
-Frames are MessagePack; you should:
+Your frontend should handle both cases: with snapshots (populate launch cache from `snapshot_launches`) and without (rely on subscribing to `"launches"` and on HTTP backfill for any mint you see from trades/tickers).
 
-- Decode as a tagged enum:
-  - `type: "connected" | "token_launch" | "trade" | "migration" | "ohclv" | "snapshot_*"`
-  - `data: { ... }` is the payload.
+**Message order on connect:** The server sends `connected` first, then (if snapshots are enabled) zero or more `snapshot_*` messages, then the live stream. If the in-memory snapshot is empty (e.g. right after a restart), the server may send snapshot_* from **Redis** when `REDIS_URL` is set; in that case `snapshot_tickers` may be missing or empty—handle missing or empty snapshot messages gracefully.
+
+**Recommended first subscription:** After connect, subscribe to `["launches", "tickers"]` so you receive every new token and periodic volume updates without firehose mode; add specific mint topics when you need per-mint trades.
+
+**Selective repeat (ACK):** Every binary frame is a **ServerMessageEnvelope**: `{ type, data, seq }`. `seq` is monotonic. The server keeps a replay buffer and tracks per-socket the highest `seq` you have ACKed. **The frontend must send ACKs** so the server can retransmit only the missing block to your socket when you fall behind.
+
+**Binary frame format:** Every binary frame is MessagePack with top-level keys: `type` (string), `data` (object), `seq` (number, u64). Decode once; then dispatch on `type`, use `data` as the payload; track the maximum `seq` for ACK.
+
+### Sending ACK (required for selective repeat)
+
+**Yes, the FE must send ACKs.** Without them, selective repeat does not work as intended.
+
+- **Format (JSON text frame):** `{ "method": "ack", "params": <seq> }` — `params` must be a **number** (the seq value).
+- **Cumulative:** Sending ack(123) means "I have received every message with seq ≤ 123". Always send the **highest** seq you have received so far.
+- **When to send:** At least every **100 ms** or every **20–50 messages**. Do not wait forever.
+- **Implementation:** (1) On each binary frame: parse `{ type, data, seq }`; set `lastReceivedSeq = max(lastReceivedSeq, seq)`; dispatch `data` by `type`. (2) On a 100 ms timer (or every 20 messages): if `lastReceivedSeq` changed, send one text frame: `{"method":"ack","params":lastReceivedSeq}`. (3) Retransmitted messages arrive as normal binary envelopes (same `type`/`data`/`seq`); apply them the same way, then send ACK with the new highest seq. (4) If you see `seq !== lastReceivedSeq + 1`, you had a gap; the server will send the missing seqs on the same connection; apply them when they arrive.
 
 See `docs/messages.md` for exact shapes; below is the minimal subset you usually care about.
 
@@ -73,13 +90,33 @@ Behaviour:
 
 The server does not send acks for subscribe/unsubscribe; just start / stop getting those topics.
 
+**Client → server (JSON text frames only):** Subscribe: `{ "method": "subscribe", "params": ["launches", "tickers", "<MINT>", ...] }`. Unsubscribe: `{ "method": "unsubscribe", "params": ["<MINT>", ...] }`. **ACK (required):** `{ "method": "ack", "params": <seq> }` with `params` = highest seq received (number); send at least every 100 ms or every 20 messages.
+
+### Subscription semantics: avoiding missed `token_launch` (clients can drop messages)
+
+The backend sends every `token_launch` on both topic `"launches"` and on the mint’s topic. **Clients can still miss a message** (e.g. network blip, reconnect, or they weren’t subscribed yet). To minimise missing metadata:
+
+1. **Subscribe to `"launches"`** as soon as you connect if you need a global feed of new tokens. Then you receive every `token_launch` and can keep your launch cache up to date. If you only subscribe to specific mints or `"tickers"`, you will **not** receive `token_launch` for mints you haven’t subscribed to, so you may see a **trade** for a mint before ever receiving its **token_launch**.
+2. **When you first see a mint** (e.g. from a trade or ticker), **subscribe to that mint**. The server will send a **one-off `token_launch`** for that mint from its cache (per-mint backfill on subscribe), so you get metadata without waiting for the next live event. See “Per-mint backfill on subscribe” below.
+3. **Always backfill via HTTP** when `launchCache[mint]` is missing: use `GET /token?mint=<MINT>` or `GET /tokens?mints=...` for multiple mints. This covers reconnects, lag, or any case where the WS message was dropped.
+
+### Per-mint backfill on subscribe
+
+When you send `Subscribe` with a **mint** topic (e.g. `["<MINT>"]`) and the server has a cached launch for that mint in `latest_launch_by_mint`, it **immediately sends one `token_launch` message** for that mint. Use this so that as soon as you care about a mint (e.g. you added a row after seeing a trade), subscribing to that mint gives you metadata without a separate HTTP call. Aggregate topics `"launches"` and `"tickers"` do **not** trigger this one-off send; only mint-like topics do.
+
+---
+
+## Supported launches
+
+The pipeline supports **Pump.fun** token launches only (CreateEvent). Metadata (`name`, `symbol`, `uri`) comes from the chain at decode time. PumpAMM and other launchpads are not supported yet.
+
 ---
 
 ## Token details: single source of truth (critical contract)
 
-**Pump.fun launches** include a CreateEvent in logs, so the pipeline normally sends `token_launch` with token details (`name`, `symbol`, `uri`) from that CreateEvent as soon as they are decoded.
+**Pump.fun launches** include a CreateEvent in logs, so the pipeline sends `token_launch` with token details (`name`, `symbol`, `uri`) from that CreateEvent as soon as they are decoded.
 
-**PumpAMM direct launches** (a token is minted “normally” and then a pool is created via `CreatePool`) may arrive as a `token_launch` with **placeholder metadata** (often `name = mint`, `symbol = ""`, `uri = ""`) so the mint enters the list and AMM trades can be tracked immediately. The pipeline then does an **RPC metadata fetch** and will **rebroadcast** `token_launch` with real `name/symbol/uri` as soon as it can.
+**Removed:** PumpAMM direct launches and RPC metadata fetch/rebroadcast are no longer supported.
 
 - **Token metadata** (name, symbol, uri, creator, user, PDAs, curve state, etc.) comes **only** from:
   - Live `token_launch` messages (topic `"launches"` or per‑mint topic), and
@@ -95,9 +132,7 @@ The server does not send acks for subscribe/unsubscribe; just start / stop getti
   - If `launchCache[mint]` is missing, you **must treat the token details as unknown** and:
     - Render a placeholder (e.g. mint shorthand or “Loading…”), and
     - Optionally call `/token?mint=<MINT>` as a backfill (see below).
-- **Fallback when WS is missed:** If you have a mint from `trade` / `migration` / `snapshot_tickers` but `launchCache[mint]` is still missing after a short grace period (e.g. 1–3 seconds), call the HTTP API to backfill metadata:
-  - `GET /token?mint=<MINT>` → returns `{ name, symbol, uri, creator }` from ClickHouse `token_launches` (latest by received_at).
-  - Then upsert into your `launchCache[mint]` (and keep waiting for WS `token_launch` as the authoritative full payload).
+- **Fallback when WS is missed:** If you have a mint from `trade` / `migration` / `snapshot_tickers` but `launchCache[mint]` is still missing after a short grace period (e.g. 1–3 seconds), call the HTTP API to backfill metadata (see **HTTP backfill** below). Then upsert into your `launchCache[mint]` (and keep waiting for WS `token_launch` as the authoritative full payload).
 
 ---
 
@@ -105,11 +140,13 @@ The server does not send acks for subscribe/unsubscribe; just start / stop getti
 
 ### 1. `connected`
 
+Each binary frame is an envelope: `{ "type": "connected", "data": { ... }, "seq": <u64> }`. Example:
+
 ```json
-{ "type": "connected", "data": { "client_id": 123 } }
+{ "type": "connected", "data": { "client_id": 123, "recommended_topics": ["launches", "tickers"] }, "seq": 1 }
 ```
 
-Use only for logging / debugging.
+Use `client_id` for logging; use `recommended_topics` as a hint for initial subscription. Use `seq` for gap detection and for sending cumulative ACKs (see **Selective repeat (ACK)** above).
 
 ### 2. `snapshot_*` on connect (initial state)
 
@@ -148,9 +185,7 @@ Follow these steps so mints never appear without token details **once the pipeli
 
 3. **Live `token_launch`**
    - On every **`token_launch`** message: **set `launchCache[data.mint] = data`** (full replace). Then update the list/card for that mint so the row shows `data.name`, `data.symbol`, `data.uri`, etc.
-   - This applies to:
-     - The initial launch.
-     - Any later `token_launch` rebroadcasts (e.g. after RPC metadata fetch or before a migration). Treat them as authoritative and overwrite your cache.
+   - This applies to the initial launch and any later `token_launch` updates (e.g. before a migration). Treat them as authoritative and overwrite your cache.
 
 4. **Live `trade` / `migration` / `ohclv`**
    - Update price, volume, and migration state by mint.
@@ -169,8 +204,7 @@ Follow these steps so mints never appear without token details **once the pipeli
 
 Payload (`TokenLaunchPayload`). Same shape is used for **live** `token_launch` and for **snapshot_launches** on connect.
 
-- **Pump.fun**: token details come from CreateEvent, so `name/symbol/uri` are expected to be filled immediately.
-- **PumpAMM direct CreatePool**: the first `token_launch` may have placeholder `name/symbol/uri`, followed by a later `token_launch` update after the pipeline backfills metadata via RPC.
+Token details come from the Pump.fun CreateEvent at decode time.
 
 Use this payload as the single source of truth for token metadata (see “Token details: single source of truth” and “Frontend implementation” above).
 
@@ -180,7 +214,6 @@ Use this payload as the single source of truth for token metadata (see “Token 
 - **Accounts:** `pump_accounts` (bonding curve PDAs etc.)
 - **Constants:** `pump_constants` (program IDs, token_decimals)
 - **Curve:** `initial_bonding_curve_state?` (virtual/real reserves at create)
-- **Security:** `security?` (currently always `null`; no live security updates are sent)
 - **Price / liquidity:** `price`, `market_cap`, `liquidity_sol` (derived from curve state; may be 0)
 - **Create-event fields (from Pump.fun CreateEvent):**
   - `txn_timestamp` (u64): create time in **milliseconds** (Unix). Use for “launched at” and sorting.
@@ -212,7 +245,7 @@ Key fields:
 **Volume semantics:** All volume fields are in **SOL** (not lamports). They are rolling windows from **on-chain trade time** (5m, 1h, 6h, 24h). The pipeline deduplicates by transaction (same tx is never counted twice). Use `volume_sol` or `volume_24h` for “total volume” display; both are the 24h window.
 
 **Volume and market cap:**
-- **Market cap** is sent with the launch and with every trade **without awaiting** any slow work (security fetch, DB, Redis run in the background). So mcap appears as soon as we have it and matches Pump.fun.
+- **Market cap** is sent with the launch and with every trade as soon as we have it (matches Pump.fun).
 - **Volume** is computed **accurately** by recalculating from trade history (not incremental), with a configurable delay (default 3s via `VOLUME_DISPLAY_DELAY_SECS`; set to `0` for instant volume). You get volume in two ways:
   1. **On each trade:** the `trade` message includes delayed volume fields (`volume_sol`, `volume_5m`, etc.) so the UI can update on every trade (value excludes the last N seconds).
   2. **Periodic tickers:** subscribe to topic `"tickers"` to receive `snapshot_tickers` every N seconds with the same accurate delayed volume for all tokens. Prefer this for a single source of truth for volume if you want smooth, batched updates.
@@ -310,6 +343,23 @@ Response shape (TradingView UDF):
 
 Backed by ClickHouse OHLCV; frontends can use this for initial chart history and then switch to streaming `ohclv` over WebSocket.
 
+### HTTP backfill: GET /token and GET /tokens
+
+Use these when the WebSocket missed a `token_launch` (e.g. after reconnect or lag) so you can fill `launchCache[mint]`.
+
+**GET /token?mint=&lt;MINT&gt;**
+
+- **Response (200):** JSON `{ "name", "symbol", "uri", "creator" }` (latest by received_at from ClickHouse `token_launches`).
+- **404:** Mint not found.
+- **400:** Missing or empty `mint` query param (plain text body).
+- **503:** ClickHouse not configured (plain text: `"ClickHouse not configured"`).
+
+**GET /tokens?mints=&lt;MINT1&gt;,&lt;MINT2&gt;,...**
+
+- **Response (200):** JSON array of `{ "mint", "name", "symbol", "uri", "creator" }` for each mint that exists. Max **100 mints** per request; only mints that exist are returned; order is not guaranteed.
+- **400:** Missing/empty `mints` or more than 100 mints (plain text body).
+- **503:** ClickHouse not configured (plain text: `"ClickHouse not configured"`).
+
 ### GET /health and GET /
 
 - Return `200 OK` and `"OK"` body while the process is healthy.
@@ -321,18 +371,16 @@ Backed by ClickHouse OHLCV; frontends can use this for initial chart history and
 
 - **WebSocket**
   - [ ] Connect to `ws://host:WS_PORT`.
-  - [ ] Decode MessagePack `ServerMessage` frames.
-  - [ ] On connect, replace state from `snapshot_*` messages.
+  - [ ] Decode each binary frame as a **ServerMessageEnvelope** (`type`, `data`, `seq`). Use `data` as the payload; use `seq` for gap detection and for ACKs.
+  - [ ] Send **cumulative ACK** so the server can selectively retransmit: text frame `{ "method": "ack", "params": <seq> }` where `<seq>` is the highest seq received (e.g. every N messages or every 100 ms).
+  - [ ] On connect, replace state from `snapshot_*` messages. If `seq` jumps by more than 1, you missed messages; the server will retransmit if you ACK, or reconnect to get a fresh snapshot.
   - [ ] Handle live `token_launch`, `trade`, `migration`, `ohclv`.
   - [ ] Use `token_launch` / `snapshot_launches` fields: `user`, `txn_timestamp`, `is_token_2022`, `token_total_supply?`, `token_program?`, `is_mayhem_mode?` where needed (see §3).
-  - [ ] Use subscribe/unsubscribe messages to limit per‑mint traffic.
+  - [ ] Subscribe to `["launches", "tickers"]` (recommended) then add mint topics as needed; use `recommended_topics` from `connected` as a hint.
 
 - **Charts**
   - [ ] Use `/history` for backfill.
   - [ ] Apply streaming `ohclv` on top for live candles.
 
-- **Security**
-  - [ ] Rug Check / mint security is not provided by the pipeline; omit or implement via your own RPC/API if needed.
-
-With this, you can build a full token list + detail view + charts without touching RPC directly.
+With this, you can build a full token list + detail view + charts. Mint security / Rug Check is not provided by the pipeline; implement via your own RPC/API if needed.
 

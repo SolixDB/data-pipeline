@@ -82,8 +82,6 @@ pub struct TokenLaunch {
     pub initial_bonding_curve_state: Option<BondingCurveState>,
     #[serde(default)]
     pub pump_constants: PumpProtocolConstants,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub security: Option<crate::security::MintSecurity>,
     #[serde(default)]
     pub is_token_2022: bool,
     pub txn_timestamp: u64,

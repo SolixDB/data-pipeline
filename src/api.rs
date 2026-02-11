@@ -159,6 +159,45 @@ async fn get_token(
     }
 }
 
+const MAX_TOKENS_BATCH: usize = 100;
+
+/// Batch HTTP fallback for token metadata. Use when backfilling many mints after reconnect.
+/// Query: /tokens?mints=<MINT1>,<MINT2>,...
+async fn get_tokens_batch(
+    State(state): State<AppState>,
+    Query(params): Query<std::collections::HashMap<String, String>>,
+) -> impl IntoResponse {
+    let mints_param = params.get("mints").cloned().unwrap_or_default();
+    if mints_param.is_empty() {
+        return (StatusCode::BAD_REQUEST, "missing mints (comma-separated)").into_response();
+    }
+    let mints: Vec<String> = mints_param
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    if mints.is_empty() {
+        return (StatusCode::BAD_REQUEST, "mints list empty").into_response();
+    }
+    if mints.len() > MAX_TOKENS_BATCH {
+        return (
+            StatusCode::BAD_REQUEST,
+            format!("at most {} mints per request", MAX_TOKENS_BATCH),
+        )
+            .into_response();
+    }
+    let Some(ref client) = state.clickhouse else {
+        return (StatusCode::SERVICE_UNAVAILABLE, "ClickHouse not configured").into_response();
+    };
+    match db::fetch_token_metadata_batch(client.as_ref(), &mints).await {
+        Ok(meta) => Json(meta).into_response(),
+        Err(e) => {
+            tracing::error!("Failed to fetch token metadata batch: {}", e);
+            (StatusCode::INTERNAL_SERVER_ERROR, "Database error").into_response()
+        }
+    }
+}
+
 async fn get_history(
     State(state): State<AppState>,
     Query(params): Query<UdfHistoryParams>,
@@ -238,6 +277,7 @@ impl ApiServer {
             .route("/config", get(get_config))
             .route("/symbols", get(get_symbols))
             .route("/token", get(get_token))
+            .route("/tokens", get(get_tokens_batch))
             .route("/history", get(get_history))
             .route("/health", get(get_health))
             .route("/", get(get_health)) // Root health check

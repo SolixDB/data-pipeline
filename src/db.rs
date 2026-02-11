@@ -424,6 +424,36 @@ pub async fn fetch_token_metadata_with_creator(
     Ok(first)
 }
 
+/// Token metadata with mint, for batch API response.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TokenMetadataWithCreatorAndMint {
+    pub mint: String,
+    pub name: String,
+    pub symbol: String,
+    pub uri: String,
+    pub creator: String,
+}
+
+/// Fetches metadata (name, symbol, uri, creator) for multiple mints. Returns only mints that exist; order not guaranteed.
+pub async fn fetch_token_metadata_batch(
+    client: &Client,
+    mints: &[String],
+) -> clickhouse::error::Result<Vec<TokenMetadataWithCreatorAndMint>> {
+    let mut out = Vec::with_capacity(mints.len());
+    for mint in mints {
+        if let Ok(Some(meta)) = fetch_token_metadata_with_creator(client, mint).await {
+            out.push(TokenMetadataWithCreatorAndMint {
+                mint: mint.clone(),
+                name: meta.name,
+                symbol: meta.symbol,
+                uri: meta.uri,
+                creator: meta.creator,
+            });
+        }
+    }
+    Ok(out)
+}
+
 pub async fn insert_ohlcv_batch(
     client: &Client,
     rows: &[OhclvRow],
