@@ -2,6 +2,7 @@ use yellowstone_vixen_core::instruction::InstructionUpdate;
 use crate::events::{Migration, Trade, TradeDirection};
 
 const AMM_EVENT_MIN_SIZE: usize = 144 + 32;
+const WSOL_MINT: &str = "So11111111111111111111111111111111111111112";
 
 /// Anchor event discriminator: first 8 bytes of sha256("event:CreatePoolEvent").
 const CREATE_POOL_EVENT_DISCRIMINATOR: [u8; 8] = [0xb1, 0x31, 0x0c, 0xd2, 0xa0, 0x76, 0xa7, 0x74];
@@ -70,13 +71,21 @@ fn decode_create_pool_event(
     };
     let creator = bs58::encode(&payload[10..42]).into_string();
     let base_mint = bs58::encode(&payload[42..74]).into_string();
+    // quoteMint is part of the min layout (not optional).
+    let quote_mint_full = bs58::encode(&payload[74..106]).into_string();
+    // Never track WSOL as the token mint. Choose the non-WSOL mint as `mint`.
+    let mint = if base_mint == WSOL_MINT {
+        quote_mint_full.clone()
+    } else {
+        base_mint.clone()
+    };
     let base_amount_in = u64::from_le_bytes(payload[108..116].try_into().ok()?);
     let quote_amount_in = u64::from_le_bytes(payload[116..124].try_into().ok()?);
     let pool = bs58::encode(&payload[165..197]).into_string();
 
     let (quote_mint, lp_mint, coin_creator, is_mayhem_mode, pool_base_amount, pool_quote_amount, initial_liquidity) =
         if data.len() >= CREATE_POOL_EVENT_FULL_SIZE {
-            let quote_mint = Some(bs58::encode(&payload[74..106]).into_string());
+            let quote_mint = Some(quote_mint_full.clone());
             let pool_base_amount = Some(u64::from_le_bytes(payload[124..132].try_into().ok()?));
             let pool_quote_amount = Some(u64::from_le_bytes(payload[132..140].try_into().ok()?));
             let initial_liquidity = Some(u64::from_le_bytes(payload[148..156].try_into().ok()?));
@@ -97,7 +106,7 @@ fn decode_create_pool_event(
     Some(Migration {
         signature: signature.to_string(),
         slot,
-        mint: base_mint,
+        mint,
         user: creator,
         bonding_curve: String::new(),
         pool,
@@ -108,7 +117,8 @@ fn decode_create_pool_event(
         received_at,
         sent_at: 0,
         bonding_curve_state,
-        quote_mint,
+        // Always include quote mint (it’s always present in the event).
+        quote_mint: Some(quote_mint_full).or(quote_mint),
         lp_mint,
         coin_creator,
         is_mayhem_mode,
@@ -282,8 +292,18 @@ fn decode_sell_event(
 }
 
 fn extract_mint_from_ix(ix: &InstructionUpdate) -> Option<String> {
-    if let Some(mint) = ix.accounts.get(3).map(|p| bs58::encode(&p.0).into_string()) {
-        return Some(mint);
+    // pump_amm buy/sell ix accounts typically include both mints. Prefer the non-WSOL mint.
+    if let Some(mint3) = ix.accounts.get(3).map(|p| bs58::encode(&p.0).into_string()) {
+        if mint3 != WSOL_MINT {
+            return Some(mint3);
+        }
+        if let Some(mint4) = ix.accounts.get(4).map(|p| bs58::encode(&p.0).into_string()) {
+            if mint4 != WSOL_MINT {
+                return Some(mint4);
+            }
+        }
+        // Fall back to whatever we got (even if WSOL) to keep parsing, but callers should handle this.
+        return Some(mint3);
     }
 
     let token_program = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
@@ -431,11 +451,17 @@ pub fn parse_migration_events_from_amm(
         let pool = bs58::encode(&ix.accounts[0].0).into_string();
         let creator = bs58::encode(&ix.accounts[2].0).into_string();
         let base_mint = bs58::encode(&ix.accounts[3].0).into_string();
+        let quote_mint = ix.accounts.get(4).map(|p| bs58::encode(&p.0).into_string());
+        let mint = if base_mint == WSOL_MINT {
+            quote_mint.clone().unwrap_or(base_mint.clone())
+        } else {
+            base_mint.clone()
+        };
         let txn_timestamp = received_at / 1000;
         out.push(Migration {
             signature: signature.clone(),
             slot: ix.shared.slot,
-            mint: base_mint,
+            mint,
             user: creator,
             bonding_curve: String::new(),
             pool,
@@ -446,7 +472,7 @@ pub fn parse_migration_events_from_amm(
             received_at,
             sent_at: 0,
             bonding_curve_state: None,
-            quote_mint: None,
+            quote_mint,
             lp_mint: None,
             coin_creator: None,
             is_mayhem_mode: None,
