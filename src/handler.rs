@@ -593,7 +593,8 @@ async fn handle_transaction(
         });
     }
 
-    // Only send trades for mints we've sent a launch for (known_mints is updated synchronously above).
+    // Only send trades for mints we've sent a launch for (known_mints). Skip trades for tokens we
+    // don't track (e.g. BONK or other existing tokens) so we never invent launches for them.
     for mut trade in trades {
         let mut migration_event: Option<Migration> = None;
         if !known_mints.read().await.contains(&trade.mint) {
@@ -839,6 +840,29 @@ async fn handle_transaction(
             );
         }
         // #endregion
+        // Ensure frontend always receives token details before a trade: send token_launch first if we have it.
+        // This fixes the race where a fast (e.g. arbitrage) trade is delivered before the initial token_launch.
+        if let Some(ref state_lock) = snapshot_state {
+            let launch_payload_opt = {
+                let r = state_lock.read().await;
+                let payload = r.latest_launch_by_mint.get(&trade.mint).cloned();
+                let ticker = r.tickers.get(&trade.mint);
+                payload.and_then(|mut p| {
+                    ticker.map(|t| {
+                        p.price = t.price;
+                        p.market_cap = t.market_cap;
+                        p.liquidity_sol = t.liquidity_sol;
+                        p
+                    })
+                })
+            };
+            if let Some(payload) = launch_payload_opt {
+                if let Ok(bytes) = rmp_serde::to_vec_named(&ServerMessage::TokenLaunch(payload)) {
+                    ws_server.broadcast("launches".to_string(), bytes.clone());
+                    ws_server.broadcast(trade.mint.clone(), bytes);
+                }
+            }
+        }
         if let Ok(bytes) = rmp_serde::to_vec_named(&ServerMessage::Trade(trade.clone())) {
             ws_server.broadcast(trade.mint.clone(), bytes);
         }
