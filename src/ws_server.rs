@@ -182,79 +182,81 @@ async fn handle_connection(
     let welcome_msg = rmp_serde::to_vec_named(&welcome).unwrap();
     ws_sender.send(Message::Binary(welcome_msg.into())).await?;
 
-    if let Some(ref state) = server.snapshot_state {
-        let mut snap = state.read().await.clone();
-        for attempt in 0..20 {
-            if !snap.launches.is_empty() {
-                break;
-            }
-            drop(snap);
-            tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
-            snap = state.read().await.clone();
-            if attempt > 0 {
-                info!("Snapshot was empty, retry {} for client {}", attempt + 1, client_id);
-            }
-        }
-        info!(
-            "Sending snapshot to client {}: {} launches, {} trades",
-            client_id,
-            snap.launches.len(),
-            snap.trades.len()
-        );
-        if let Ok(bytes) = rmp_serde::to_vec_named(&ServerMessage::SnapshotMigrated(snap.migrated)) {
-            let _ = ws_sender.send(Message::Binary(bytes.into())).await;
-        }
-        if let Ok(bytes) = rmp_serde::to_vec_named(&ServerMessage::SnapshotSoonMigrating(snap.soon_migrating)) {
-            let _ = ws_sender.send(Message::Binary(bytes.into())).await;
-        }
-        if let Ok(bytes) = rmp_serde::to_vec_named(&ServerMessage::SnapshotLaunches(snap.launches.clone())) {
-            let _ = ws_sender.send(Message::Binary(bytes.into())).await;
-        }
-        if let Ok(bytes) = rmp_serde::to_vec_named(&ServerMessage::SnapshotTrades(snap.trades)) {
-            let _ = ws_sender.send(Message::Binary(bytes.into())).await;
-        }
-        let tickers: Vec<_> = snap.tickers.values().map(crate::messages::TokenTicker::from).collect();
-        if !tickers.is_empty() {
-            if let Ok(bytes) = rmp_serde::to_vec_named(&ServerMessage::SnapshotTickers(tickers)) {
-                let _ = ws_sender.send(Message::Binary(bytes.into())).await;
-            }
-        }
-    } else if let Some(ref redis) = server.redis_client {
-        if let Ok(mut conn) = redis.get_multiplexed_async_connection().await {
-            let migrated: Result<String, _> = conn.get(crate::storage::REDIS_KEY_MIGRATED).await;
-            let soon: Result<String, _> = conn.get(crate::storage::REDIS_KEY_SOON_MIGRATING).await;
-            if let Ok(json) = migrated {
-                if let Ok(entries) = serde_json::from_str::<Vec<crate::storage::MigratedEntry>>(&json) {
-                    if let Ok(bytes) = rmp_serde::to_vec_named(&ServerMessage::SnapshotMigrated(entries)) {
-                        let _ = ws_sender.send(Message::Binary(bytes.into())).await;
-                    }
-                }
-            }
-            if let Ok(json) = soon {
-                if let Ok(entries) = serde_json::from_str::<Vec<crate::storage::SoonMigratingEntry>>(&json) {
-                    if let Ok(bytes) = rmp_serde::to_vec_named(&ServerMessage::SnapshotSoonMigrating(entries)) {
-                        let _ = ws_sender.send(Message::Binary(bytes.into())).await;
-                    }
-                }
-            }
-            let launches: Result<String, _> = conn.get(crate::storage::REDIS_KEY_LAUNCHES).await;
-            let trades: Result<String, _> = conn.get(crate::storage::REDIS_KEY_TRADES).await;
-            if let Ok(json) = launches {
-                if let Ok(entries) = serde_json::from_str::<Vec<crate::messages::TokenLaunchPayload>>(&json) {
-                    if let Ok(bytes) = rmp_serde::to_vec_named(&ServerMessage::SnapshotLaunches(entries)) {
-                        let _ = ws_sender.send(Message::Binary(bytes.into())).await;
-                    }
-                }
-            }
-            if let Ok(json) = trades {
-                if let Ok(entries) = serde_json::from_str::<Vec<crate::events::Trade>>(&json) {
-                    if let Ok(bytes) = rmp_serde::to_vec_named(&ServerMessage::SnapshotTrades(entries)) {
-                        let _ = ws_sender.send(Message::Binary(bytes.into())).await;
-                    }
-                }
-            }
-        }
-    }
+    // BOLD: Snapshots disabled — clients get no initial snapshot (launches/trades/migrated/soon_migrating/tickers).
+    // Only the live stream is sent. Re-enable by uncommenting the blocks below.
+    // if let Some(ref state) = server.snapshot_state {
+    //     let mut snap = state.read().await.clone();
+    //     for attempt in 0..20 {
+    //         if !snap.launches.is_empty() {
+    //             break;
+    //         }
+    //         drop(snap);
+    //         tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+    //         snap = state.read().await.clone();
+    //         if attempt > 0 {
+    //             info!("Snapshot was empty, retry {} for client {}", attempt + 1, client_id);
+    //         }
+    //     }
+    //     info!(
+    //         "Sending snapshot to client {}: {} launches, {} trades",
+    //         client_id,
+    //         snap.launches.len(),
+    //         snap.trades.len()
+    //     );
+    //     if let Ok(bytes) = rmp_serde::to_vec_named(&ServerMessage::SnapshotMigrated(snap.migrated)) {
+    //         let _ = ws_sender.send(Message::Binary(bytes.into())).await;
+    //     }
+    //     if let Ok(bytes) = rmp_serde::to_vec_named(&ServerMessage::SnapshotSoonMigrating(snap.soon_migrating)) {
+    //         let _ = ws_sender.send(Message::Binary(bytes.into())).await;
+    //     }
+    //     if let Ok(bytes) = rmp_serde::to_vec_named(&ServerMessage::SnapshotLaunches(snap.launches.clone())) {
+    //         let _ = ws_sender.send(Message::Binary(bytes.into())).await;
+    //     }
+    //     if let Ok(bytes) = rmp_serde::to_vec_named(&ServerMessage::SnapshotTrades(snap.trades)) {
+    //         let _ = ws_sender.send(Message::Binary(bytes.into())).await;
+    //     }
+    //     let tickers: Vec<_> = snap.tickers.values().map(crate::messages::TokenTicker::from).collect();
+    //     if !tickers.is_empty() {
+    //         if let Ok(bytes) = rmp_serde::to_vec_named(&ServerMessage::SnapshotTickers(tickers)) {
+    //             let _ = ws_sender.send(Message::Binary(bytes.into())).await;
+    //         }
+    //     }
+    // } else if let Some(ref redis) = server.redis_client {
+    //     if let Ok(mut conn) = redis.get_multiplexed_async_connection().await {
+    //         let migrated: Result<String, _> = conn.get(crate::storage::REDIS_KEY_MIGRATED).await;
+    //         let soon: Result<String, _> = conn.get(crate::storage::REDIS_KEY_SOON_MIGRATING).await;
+    //         if let Ok(json) = migrated {
+    //             if let Ok(entries) = serde_json::from_str::<Vec<crate::storage::MigratedEntry>>(&json) {
+    //                 if let Ok(bytes) = rmp_serde::to_vec_named(&ServerMessage::SnapshotMigrated(entries)) {
+    //                     let _ = ws_sender.send(Message::Binary(bytes.into())).await;
+    //                 }
+    //             }
+    //         }
+    //         if let Ok(json) = soon {
+    //             if let Ok(entries) = serde_json::from_str::<Vec<crate::storage::SoonMigratingEntry>>(&json) {
+    //                 if let Ok(bytes) = rmp_serde::to_vec_named(&ServerMessage::SnapshotSoonMigrating(entries)) {
+    //                     let _ = ws_sender.send(Message::Binary(bytes.into())).await;
+    //                 }
+    //             }
+    //         }
+    //         let launches: Result<String, _> = conn.get(crate::storage::REDIS_KEY_LAUNCHES).await;
+    //         let trades: Result<String, _> = conn.get(crate::storage::REDIS_KEY_TRADES).await;
+    //         if let Ok(json) = launches {
+    //             if let Ok(entries) = serde_json::from_str::<Vec<crate::messages::TokenLaunchPayload>>(&json) {
+    //                 if let Ok(bytes) = rmp_serde::to_vec_named(&ServerMessage::SnapshotLaunches(entries)) {
+    //                     let _ = ws_sender.send(Message::Binary(bytes.into())).await;
+    //                 }
+    //             }
+    //         }
+    //         if let Ok(json) = trades {
+    //             if let Ok(entries) = serde_json::from_str::<Vec<crate::events::Trade>>(&json) {
+    //                 if let Ok(bytes) = rmp_serde::to_vec_named(&ServerMessage::SnapshotTrades(entries)) {
+    //                     let _ = ws_sender.send(Message::Binary(bytes.into())).await;
+    //                 }
+    //             }
+    //         }
+    //     }
+    // }
 
     let mut subscriptions = std::collections::HashSet::new();
 
