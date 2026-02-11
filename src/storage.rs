@@ -824,7 +824,10 @@ pub fn spawn_storage_worker(
                     .map(|p| (p.mint.clone(), p))
                     .collect();
                 w.trades = recent_trades.iter().cloned().collect();
-                
+                // Bound tickers to mints we have a launch for (avoids unbounded growth)
+                let keep_mints: HashSet<String> = w.latest_launch_by_mint.keys().cloned().collect();
+                w.tickers.retain(|mint, _| keep_mints.contains(mint));
+
                 // Clone map quickly while holding lock (fast)
                 tickers_map_clone = w.tickers.clone();
                 current_slot = w.last_processed_slot;

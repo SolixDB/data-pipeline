@@ -54,7 +54,11 @@ async fn main() -> anyhow::Result<()> {
         .and_then(|s| s.parse().ok())
         .unwrap_or(5566);
 
-    let ws_config = ws_server::WsConfig::default();
+    let ws_config = ws_server::WsConfig {
+        snapshot_launch_limit: config_arc.snapshot_launch_limit,
+        snapshot_trade_limit: config_arc.snapshot_trade_limit,
+        ..ws_server::WsConfig::default()
+    };
     let snapshot_state = Arc::new(RwLock::new(SnapshotState::default()));
     let redis_client: Option<Arc<redis::Client>> = config_arc
         .redis_url

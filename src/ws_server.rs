@@ -1,4 +1,4 @@
-use crate::messages::{ConnectedPayload, ServerMessage, ServerMessageEnvelope};
+use crate::messages::{ConnectedPayload, ServerMessage, ServerMessageEnvelope, SnapshotInfoPayload};
 use crate::storage::SnapshotState;
 use bytes::Bytes;
 use futures_util::{SinkExt, StreamExt};
@@ -77,6 +77,10 @@ pub struct WsConfig {
     pub max_lag_drop: Option<u64>,
     /// When true, send snapshot_* (launches, trades, tickers, migrated, soon_migrating) on each client connect.
     pub send_snapshot_on_connect: bool,
+    /// Max launches to send in Redis fallback snapshot (when in-memory is empty). Should match storage limit.
+    pub snapshot_launch_limit: usize,
+    /// Max trades to send in Redis fallback snapshot. Should match storage limit.
+    pub snapshot_trade_limit: usize,
 }
 
 impl Default for WsConfig {
@@ -91,6 +95,8 @@ impl Default for WsConfig {
                 .and_then(|s| s.parse().ok())
                 .and_then(|n: u64| if n == 0 { None } else { Some(n) }),
             send_snapshot_on_connect: send_snapshot,
+            snapshot_launch_limit: 50,
+            snapshot_trade_limit: 1500,
         }
     }
 }
@@ -161,6 +167,8 @@ pub struct WsServer {
     send_snapshot_on_connect: bool,
     snapshot_state: Option<Arc<RwLock<SnapshotState>>>,
     redis_client: Option<Arc<redis::Client>>,
+    snapshot_launch_limit: usize,
+    snapshot_trade_limit: usize,
     /// Replay buffer for selective repeat: retransmit to clients that didn't ACK.
     replay_buffer: Arc<RwLock<ReplayBuffer>>,
     /// Per-client last acked seq and retransmit channel.
@@ -174,6 +182,8 @@ impl WsServer {
         redis_client: Option<Arc<redis::Client>>,
     ) -> Self {
         let (broadcast_tx, _) = broadcast::channel(BROADCAST_CAPACITY);
+        let snapshot_launch_limit = config.snapshot_launch_limit.clamp(1, 10_000);
+        let snapshot_trade_limit = config.snapshot_trade_limit.clamp(1, 50_000);
         Self {
             broadcast_tx,
             next_id: AtomicU64::new(0),
@@ -183,6 +193,8 @@ impl WsServer {
             send_snapshot_on_connect: config.send_snapshot_on_connect,
             snapshot_state,
             redis_client,
+            snapshot_launch_limit,
+            snapshot_trade_limit,
             replay_buffer: Arc::new(RwLock::new(ReplayBuffer::new(REPLAY_BUFFER_LEN))),
             client_registry: Arc::new(RwLock::new(HashMap::new())),
         }
@@ -355,22 +367,46 @@ async fn handle_connection(
                     snap.launches.len(),
                     snap.trades.len()
                 );
-                if let Ok(bytes) = rmp_serde::to_vec_named(&ServerMessage::SnapshotMigrated(snap.migrated)) {
-                    let _ = ws_sender.send(Message::Binary(bytes.into())).await;
+                let seq_info = server.next_seq();
+                let info_msg = ServerMessage::SnapshotInfo(SnapshotInfoPayload {
+                    as_of_slot: snap.last_processed_slot,
+                    snapshot_seq: seq_info + 1, // first seq of snapshot data (next message)
+                });
+                let info_envelope = ServerMessageEnvelope {
+                    message: info_msg,
+                    seq: seq_info,
+                };
+                if let Ok(bytes) = rmp_serde::to_vec_named(&info_envelope) {
+                    if ws_sender.send(Message::Binary(bytes.into())).await.is_err() {
+                        warn!("Client {}: failed to send snapshot_info", client_id);
+                    }
                 }
-                if let Ok(bytes) = rmp_serde::to_vec_named(&ServerMessage::SnapshotSoonMigrating(snap.soon_migrating)) {
-                    let _ = ws_sender.send(Message::Binary(bytes.into())).await;
-                }
-                if let Ok(bytes) = rmp_serde::to_vec_named(&ServerMessage::SnapshotLaunches(snap.launches.clone())) {
-                    let _ = ws_sender.send(Message::Binary(bytes.into())).await;
-                }
-                if let Ok(bytes) = rmp_serde::to_vec_named(&ServerMessage::SnapshotTrades(snap.trades)) {
-                    let _ = ws_sender.send(Message::Binary(bytes.into())).await;
+                for msg in [
+                    ServerMessage::SnapshotMigrated(snap.migrated),
+                    ServerMessage::SnapshotSoonMigrating(snap.soon_migrating),
+                    ServerMessage::SnapshotLaunches(snap.launches.clone()),
+                    ServerMessage::SnapshotTrades(snap.trades),
+                ] {
+                    let envelope = ServerMessageEnvelope {
+                        message: msg,
+                        seq: server.next_seq(),
+                    };
+                    if let Ok(bytes) = rmp_serde::to_vec_named(&envelope) {
+                        if ws_sender.send(Message::Binary(bytes.into())).await.is_err() {
+                            warn!("Client {}: failed to send snapshot frame", client_id);
+                        }
+                    }
                 }
                 let tickers: Vec<_> = snap.tickers.values().map(crate::messages::TokenTicker::from).collect();
                 if !tickers.is_empty() {
-                    if let Ok(bytes) = rmp_serde::to_vec_named(&ServerMessage::SnapshotTickers(tickers)) {
-                        let _ = ws_sender.send(Message::Binary(bytes.into())).await;
+                    let envelope = ServerMessageEnvelope {
+                        message: ServerMessage::SnapshotTickers(tickers),
+                        seq: server.next_seq(),
+                    };
+                    if let Ok(bytes) = rmp_serde::to_vec_named(&envelope) {
+                        if ws_sender.send(Message::Binary(bytes.into())).await.is_err() {
+                            warn!("Client {}: failed to send snapshot_tickers", client_id);
+                        }
                     }
                 }
             }
@@ -379,35 +415,79 @@ async fn handle_connection(
         if !sent_from_memory {
             if let Some(ref redis) = server.redis_client {
                 if let Ok(mut conn) = redis.get_multiplexed_async_connection().await {
+                    let launch_limit = server.snapshot_launch_limit;
+                    let trade_limit = server.snapshot_trade_limit;
+                    let seq_info = server.next_seq();
+                    let info_msg = ServerMessage::SnapshotInfo(SnapshotInfoPayload {
+                        as_of_slot: 0,
+                        snapshot_seq: seq_info + 1,
+                    });
+                    let info_envelope = ServerMessageEnvelope {
+                        message: info_msg,
+                        seq: seq_info,
+                    };
+                    if let Ok(bytes) = rmp_serde::to_vec_named(&info_envelope) {
+                        let _ = ws_sender.send(Message::Binary(bytes.into())).await;
+                    }
                     let migrated: Result<String, _> = conn.get(crate::storage::REDIS_KEY_MIGRATED).await;
                     let soon: Result<String, _> = conn.get(crate::storage::REDIS_KEY_SOON_MIGRATING).await;
                     if let Ok(json) = migrated {
                         if let Ok(entries) = serde_json::from_str::<Vec<crate::storage::MigratedEntry>>(&json) {
-                            if let Ok(bytes) = rmp_serde::to_vec_named(&ServerMessage::SnapshotMigrated(entries)) {
-                                let _ = ws_sender.send(Message::Binary(bytes.into())).await;
+                            let envelope = ServerMessageEnvelope {
+                                message: ServerMessage::SnapshotMigrated(entries),
+                                seq: server.next_seq(),
+                            };
+                            if let Ok(bytes) = rmp_serde::to_vec_named(&envelope) {
+                                if ws_sender.send(Message::Binary(bytes.into())).await.is_err() {
+                                    warn!("Client {}: failed to send Redis snapshot_migrated", client_id);
+                                }
                             }
                         }
                     }
                     if let Ok(json) = soon {
                         if let Ok(entries) = serde_json::from_str::<Vec<crate::storage::SoonMigratingEntry>>(&json) {
-                            if let Ok(bytes) = rmp_serde::to_vec_named(&ServerMessage::SnapshotSoonMigrating(entries)) {
-                                let _ = ws_sender.send(Message::Binary(bytes.into())).await;
+                            let envelope = ServerMessageEnvelope {
+                                message: ServerMessage::SnapshotSoonMigrating(entries),
+                                seq: server.next_seq(),
+                            };
+                            if let Ok(bytes) = rmp_serde::to_vec_named(&envelope) {
+                                if ws_sender.send(Message::Binary(bytes.into())).await.is_err() {
+                                    warn!("Client {}: failed to send Redis snapshot_soon_migrating", client_id);
+                                }
                             }
                         }
                     }
                     let launches: Result<String, _> = conn.get(crate::storage::REDIS_KEY_LAUNCHES).await;
                     let trades: Result<String, _> = conn.get(crate::storage::REDIS_KEY_TRADES).await;
                     if let Ok(json) = launches {
-                        if let Ok(entries) = serde_json::from_str::<Vec<crate::messages::TokenLaunchPayload>>(&json) {
-                            if let Ok(bytes) = rmp_serde::to_vec_named(&ServerMessage::SnapshotLaunches(entries)) {
-                                let _ = ws_sender.send(Message::Binary(bytes.into())).await;
+                        if let Ok(mut entries) = serde_json::from_str::<Vec<crate::messages::TokenLaunchPayload>>(&json) {
+                            if entries.len() > launch_limit {
+                                entries.truncate(launch_limit);
+                            }
+                            let envelope = ServerMessageEnvelope {
+                                message: ServerMessage::SnapshotLaunches(entries),
+                                seq: server.next_seq(),
+                            };
+                            if let Ok(bytes) = rmp_serde::to_vec_named(&envelope) {
+                                if ws_sender.send(Message::Binary(bytes.into())).await.is_err() {
+                                    warn!("Client {}: failed to send Redis snapshot_launches", client_id);
+                                }
                             }
                         }
                     }
                     if let Ok(json) = trades {
-                        if let Ok(entries) = serde_json::from_str::<Vec<crate::events::Trade>>(&json) {
-                            if let Ok(bytes) = rmp_serde::to_vec_named(&ServerMessage::SnapshotTrades(entries)) {
-                                let _ = ws_sender.send(Message::Binary(bytes.into())).await;
+                        if let Ok(mut entries) = serde_json::from_str::<Vec<crate::events::Trade>>(&json) {
+                            if entries.len() > trade_limit {
+                                entries.truncate(trade_limit);
+                            }
+                            let envelope = ServerMessageEnvelope {
+                                message: ServerMessage::SnapshotTrades(entries),
+                                seq: server.next_seq(),
+                            };
+                            if let Ok(bytes) = rmp_serde::to_vec_named(&envelope) {
+                                if ws_sender.send(Message::Binary(bytes.into())).await.is_err() {
+                                    warn!("Client {}: failed to send Redis snapshot_trades", client_id);
+                                }
                             }
                         }
                     }
@@ -485,12 +565,21 @@ async fn handle_connection(
                                                         .cloned()
                                                 };
                                                 if let Some(payload) = launch_opt {
-                                                    if let Ok(bytes) = rmp_serde::to_vec_named(
-                                                        &ServerMessage::TokenLaunch(payload),
-                                                    ) {
-                                                        let _ = ws_sender
+                                                    let envelope = ServerMessageEnvelope {
+                                                        message: ServerMessage::TokenLaunch(payload),
+                                                        seq: server.next_seq(),
+                                                    };
+                                                    if let Ok(bytes) = rmp_serde::to_vec_named(&envelope) {
+                                                        if ws_sender
                                                             .send(Message::Binary(bytes.into()))
-                                                            .await;
+                                                            .await
+                                                            .is_err()
+                                                        {
+                                                            warn!(
+                                                                "Client {}: failed to send token_launch on subscribe for {}",
+                                                                client_id, topic
+                                                            );
+                                                        }
                                                     }
                                                 }
                                             }
