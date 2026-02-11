@@ -65,6 +65,7 @@ Behaviour:
 - If topics are present:
   - `topic = "launches"` → global launch feed.
   - `topic = "<mint>"` → per‑mint channel:
+    - `token_launch` for that mint (token details / metadata)
     - `trade` for that mint
     - `migration` for that mint
     - `token_security_update` for that mint
@@ -84,6 +85,9 @@ The server does not send acks for subscribe/unsubscribe; just start / stop getti
   - `snapshot_launches` on connect.
 - **Trades, migrations, tickers** carry `mint`, price, volume, etc., but **do not** carry name/symbol/uri. Do not create or show a “token row” from a trade/migration/ticker alone without merging in launch data.
 - **Rule:** For any mint you display, maintain a **launch cache keyed by mint**. When you receive `token_launch` or an item from `snapshot_launches`, **upsert by mint** (create or replace). When you receive `trade`, `migration`, or `snapshot_tickers`, **update price/volume/state for that mint** but **never overwrite or ignore the launch payload** for that mint. If you don’t have launch data for a mint yet, show a placeholder (e.g. “Loading…” or mint shorthand) until a `token_launch` or `snapshot_launches` provides it.
+- **Fallback when WS is missed:** If you have a mint from `trade` / `migration` / `snapshot_tickers` but `launchCache[mint]` is still missing after a short grace period (e.g. 1–3 seconds), call the HTTP API to backfill metadata:
+  - `GET /token?mint=<MINT>` → returns `{ name, symbol, uri, creator }` from ClickHouse `token_launches` (latest by received_at).
+  - Then upsert into your `launchCache[mint]` (and keep waiting for WS `token_launch` as the authoritative full payload).
 
 ---
 
@@ -166,6 +170,8 @@ Use this to:
 - Display supply or “mayhem” indicator when present.
 
 ### 4. `token_security_update`
+
+**Display:** Show this message in the UI for the token’s Rug Check / security section. When `type === "token_security_update"`, use `data.mint` to find the token and `data.security` as the source of truth for mint/freeze authority and supply. Example shape: `{ "type": "token_security_update", "data": { "mint": "<pubkey>", "security": { "mint_authority_renounced": true, "freeze_authority_renounced": true, ... } } }`.
 
 Payload:
 

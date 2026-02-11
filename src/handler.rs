@@ -422,9 +422,11 @@ async fn handle_transaction(
             is_mayhem_mode: launch.is_mayhem_mode,
         };
 
-        // Send launch to frontend first; then update snapshot (recent_launches, latest_launch_by_mint) so snapshot never has stale or partial data.
+        // Send launch to frontend first. Broadcast on both "launches" and per-mint topic so
+        // clients subscribed only to the mint still receive token metadata.
         if let Ok(bytes) = rmp_serde::to_vec_named(&ServerMessage::TokenLaunch(payload.clone())) {
-            ws_server.broadcast("launches".to_string(), bytes);
+            ws_server.broadcast("launches".to_string(), bytes.clone());
+            ws_server.broadcast(launch.mint.clone(), bytes);
         }
         debug!("{} | clients={}", log_msg, ws_server.client_count());
 
@@ -436,8 +438,6 @@ async fn handle_transaction(
             while w.recent_launches.front().map(|(_, _, ts)| *ts < cutoff).unwrap_or(false) {
                 w.recent_launches.pop_front();
             }
-            let kept_mints: HashSet<_> = w.recent_launches.iter().map(|(m, _, _)| m.clone()).collect();
-            w.latest_launch_by_mint.retain(|m, _| kept_mints.contains(m));
         }
 
         let metrics_client_bg = metrics_client.clone();
@@ -695,7 +695,8 @@ async fn handle_transaction(
                 }
                 if let Some(payload) = launch_payload_opt {
                     if let Ok(bytes) = rmp_serde::to_vec_named(&ServerMessage::TokenLaunch(payload)) {
-                        ws_server.broadcast("launches".to_string(), bytes);
+                        ws_server.broadcast("launches".to_string(), bytes.clone());
+                        ws_server.broadcast(m.mint.clone(), bytes);
                     }
                 }
             }
@@ -753,12 +754,9 @@ async fn handle_transaction(
         debug!("{} | clients={}", log_msg, ws_server.client_count());
     }
 
-    // Only send migrations for mints we've sent a launch for (same rule as trades).
+    // Migrations can happen long after launch; don't gate on `known_mints` or we miss snapshot_migrated.
     let migrations = multi_parser::parse_migration_events(&instructions, parser_map, received_at);
     for mut migration in migrations {
-        if !known_mints.read().await.contains(&migration.mint) {
-            continue;
-        }
         if let Some(state_lock) = snapshot_state {
             let mut launch_payload_opt = None;
             {
@@ -781,7 +779,8 @@ async fn handle_transaction(
             }
             if let Some(payload) = launch_payload_opt {
                 if let Ok(bytes) = rmp_serde::to_vec_named(&ServerMessage::TokenLaunch(payload)) {
-                    ws_server.broadcast("launches".to_string(), bytes);
+                    ws_server.broadcast("launches".to_string(), bytes.clone());
+                    ws_server.broadcast(migration.mint.clone(), bytes);
                 }
             }
         }

@@ -136,6 +136,29 @@ async fn get_symbols(
     Json(info)
 }
 
+/// HTTP fallback for token metadata when WS missed token_launch.
+/// Query: /token?mint=<MINT>
+async fn get_token(
+    State(state): State<AppState>,
+    Query(params): Query<std::collections::HashMap<String, String>>,
+) -> impl IntoResponse {
+    let mint = params.get("mint").cloned().unwrap_or_default();
+    if mint.is_empty() {
+        return (StatusCode::BAD_REQUEST, "missing mint").into_response();
+    }
+    let Some(ref client) = state.clickhouse else {
+        return (StatusCode::SERVICE_UNAVAILABLE, "ClickHouse not configured").into_response();
+    };
+    match db::fetch_token_metadata_with_creator(client.as_ref(), &mint).await {
+        Ok(Some(meta)) => Json(meta).into_response(),
+        Ok(None) => (StatusCode::NOT_FOUND, "not found").into_response(),
+        Err(e) => {
+            tracing::error!("Failed to fetch token metadata: {}", e);
+            (StatusCode::INTERNAL_SERVER_ERROR, "Database error").into_response()
+        }
+    }
+}
+
 async fn get_history(
     State(state): State<AppState>,
     Query(params): Query<UdfHistoryParams>,
@@ -214,6 +237,7 @@ impl ApiServer {
         let app = Router::new()
             .route("/config", get(get_config))
             .route("/symbols", get(get_symbols))
+            .route("/token", get(get_token))
             .route("/history", get(get_history))
             .route("/health", get(get_health))
             .route("/", get(get_health)) // Root health check

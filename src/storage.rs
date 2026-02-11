@@ -537,6 +537,12 @@ pub fn spawn_storage_worker(
                  let mut w = state.write().await;
                  w.migrated = migrated_list.clone();
                  w.launches = last_launches.iter().cloned().collect();
+                 // Keep a mint->launch map for fast lookup (e.g. migration-time re-send of token metadata).
+                 w.latest_launch_by_mint = last_launches
+                     .iter()
+                     .cloned()
+                     .map(|p| (p.mint.clone(), p))
+                     .collect();
                  w.trades = recent_trades.iter().cloned().collect();
                  w.soon_migrating = curve_reserves
                     .iter()
@@ -809,6 +815,11 @@ pub fn spawn_storage_worker(
                 w.migrated = migrated_list.clone();
                 w.soon_migrating = soon_migrating.clone();
                 w.launches = last_launches.iter().cloned().collect();
+                w.latest_launch_by_mint = last_launches
+                    .iter()
+                    .cloned()
+                    .map(|p| (p.mint.clone(), p))
+                    .collect();
                 w.trades = recent_trades.iter().cloned().collect();
                 
                 // Clone map quickly while holding lock (fast)

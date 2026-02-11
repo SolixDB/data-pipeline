@@ -385,6 +385,15 @@ pub struct TokenMetadataRow {
     pub uri: String,
 }
 
+/// Token launch metadata for HTTP fallback (includes creator). Fetched from token_launches by mint.
+#[derive(Debug, Row, Serialize, Deserialize)]
+pub struct TokenMetadataWithCreatorRow {
+    pub name: String,
+    pub symbol: String,
+    pub uri: String,
+    pub creator: String,
+}
+
 /// Fetches name, symbol, uri for a mint from token_launches (latest by received_at). Returns None if not found.
 pub async fn fetch_token_metadata(
     client: &Client,
@@ -396,6 +405,21 @@ pub async fn fetch_token_metadata(
         ))
         .bind(mint)
         .fetch::<TokenMetadataRow>()?;
+    let first = cursor.next().await?;
+    Ok(first)
+}
+
+/// Fetches name, symbol, uri, creator for a mint from token_launches (latest by received_at). Returns None if not found.
+pub async fn fetch_token_metadata_with_creator(
+    client: &Client,
+    mint: &str,
+) -> clickhouse::error::Result<Option<TokenMetadataWithCreatorRow>> {
+    let mut cursor = client
+        .query(&format!(
+            "SELECT name, symbol, uri, creator FROM {TABLE_TOKEN_LAUNCHES} WHERE mint = ? ORDER BY received_at DESC LIMIT 1"
+        ))
+        .bind(mint)
+        .fetch::<TokenMetadataWithCreatorRow>()?;
     let first = cursor.next().await?;
     Ok(first)
 }
