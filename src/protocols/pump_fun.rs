@@ -10,6 +10,16 @@ pub const PUMP_FUN_FEE_RECIPIENT: &str = "CebN5WGQ4jvEPvsVU4EoHEpgzq1VV7AbicfhtW
 pub const PUMP_FUN_PROGRAM_ID: &str = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P";
 pub const PUMP_FUN_FEE_PROGRAM_ID: &str = "pfeeUxB6jkeY1Hxd7CsFCAjcbHA9rWtchMGdZ6VojVZ";
 
+/// Create instruction discriminator (IDL create).
+const CREATE_DISCRIMINATOR: [u8; 8] = [0x18, 0x1e, 0xc8, 0x28, 0x05, 0x1c, 0x07, 0x77];
+/// CreateV2 instruction discriminator (IDL createV2).
+const CREATE_V2_DISCRIMINATOR: [u8; 8] = [0xd6, 0x90, 0x4c, 0xec, 0x5f, 0x8b, 0x31, 0xb4];
+
+fn is_create_instruction(ix: &InstructionUpdate) -> bool {
+    ix.data.len() >= 8
+        && (ix.data[0..8] == CREATE_DISCRIMINATOR || ix.data[0..8] == CREATE_V2_DISCRIMINATOR)
+}
+
 pub fn has_create_in_logs(ix: &InstructionUpdate) -> bool {
     ix.shared.log_messages.iter().any(|l| {
         (l.contains("Instruction: Create") || l.contains("Instruction: CreateV2"))
@@ -18,6 +28,7 @@ pub fn has_create_in_logs(ix: &InstructionUpdate) -> bool {
     })
 }
 
+#[allow(dead_code)]
 pub fn has_create_v2_in_logs(ix: &InstructionUpdate) -> bool {
     ix.shared.log_messages.iter().any(|l| l.contains("Instruction: CreateV2"))
 }
@@ -78,22 +89,29 @@ fn try_parse_create_event_from_logs(ix: &InstructionUpdate) -> Option<(String, S
     use base64::Engine;
     let decoder = base64::engine::general_purpose::STANDARD;
     for log in &ix.shared.log_messages {
-        let data_str = log.strip_prefix("Program data: ")?;
+        let data_str = log
+            .trim()
+            .strip_prefix("Program data: ")
+            .or_else(|| log.trim().strip_prefix("> Program data: "))?;
         let data = decoder.decode(data_str.trim()).ok()?;
-        if data.len() < 8 + 4 * 3 + 32 * 4 {
+        if data.len() < 8 + 4 * 3 + 32 * 4 + 8 {
             continue;
         }
         let mut offset = 8;
         let name = read_length_prefixed_string(&data, &mut offset)?;
         let symbol = read_length_prefixed_string(&data, &mut offset)?;
         let uri = read_length_prefixed_string(&data, &mut offset)?;
-        if offset + 32 * 4 > data.len() {
+        if offset + 32 * 4 + 8 > data.len() {
             continue;
         }
         let mint = bs58::encode(&data[offset..offset + 32]).into_string();
         let bonding_curve = bs58::encode(&data[offset + 32..offset + 64]).into_string();
         let _user = bs58::encode(&data[offset + 64..offset + 96]).into_string();
         let creator = bs58::encode(&data[offset + 96..offset + 128]).into_string();
+        let timestamp_sec = i64::from_le_bytes(data[offset + 128..offset + 136].try_into().ok()?);
+        if !(1577836800..=2524608000).contains(&(timestamp_sec as u64)) {
+            continue;
+        }
         if mint.is_empty() || bonding_curve.is_empty() {
             continue;
         }
@@ -103,11 +121,11 @@ fn try_parse_create_event_from_logs(ix: &InstructionUpdate) -> Option<(String, S
 }
 
 pub fn parse_create(ix: &InstructionUpdate, received_at: u64) -> Option<crate::events::TokenLaunch> {
-    if !has_create_in_logs(ix) {
+    if !has_create_in_logs(ix) || !is_create_instruction(ix) {
         return None;
     }
 
-    let is_token_2022 = has_create_v2_in_logs(ix);
+    let is_token_2022 = ix.data.len() >= 8 && ix.data[0..8] == CREATE_V2_DISCRIMINATOR;
     let signature = bs58::encode(ix.shared.signature.as_slice()).into_string();
     let txn_timestamp = txn_timestamp_from_create_logs(ix).unwrap_or(received_at / 1000);
 
