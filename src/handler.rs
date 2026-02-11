@@ -593,11 +593,15 @@ async fn handle_transaction(
         });
     }
 
-    // Only send trades for mints we've sent a launch for (known_mints). Skip trades for tokens we
-    // don't track (e.g. BONK or other existing tokens) so we never invent launches for them.
+    // Only send trades for:
+    // - mints we've sent a launch for (known_mints), OR
+    // - bonding-curve trades (is_bonding_curve), so we don't miss early Pump.fun volume
+    //   even if a few starter trades arrive before we processed the launch tx.
+    // This still skips non-Pump tokens (e.g. BONK on random AMMs) while keeping Pump volumes accurate.
     for mut trade in trades {
         let mut migration_event: Option<Migration> = None;
-        if !known_mints.read().await.contains(&trade.mint) {
+        let is_known = known_mints.read().await.contains(&trade.mint);
+        if !is_known && !trade.is_bonding_curve {
             continue;
         }
 

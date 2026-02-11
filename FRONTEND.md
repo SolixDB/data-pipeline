@@ -76,24 +76,33 @@ The server does not send acks for subscribe/unsubscribe; just start / stop getti
 
 ---
 
-## Token details: single source of truth
+## Token details: single source of truth (critical contract)
 
-**Pump.fun launches** include a CreateEvent in logs, so the pipeline normally sends `token_launch` with token details (`name`, `symbol`, `uri`) from that CreateEvent.
+**Pump.fun launches** include a CreateEvent in logs, so the pipeline normally sends `token_launch` with token details (`name`, `symbol`, `uri`) from that CreateEvent as soon as they are decoded.
 
 **PumpAMM direct launches** (a token is minted “normally” and then a pool is created via `CreatePool`) may arrive as a `token_launch` with **placeholder metadata** (often `name = mint`, `symbol = ""`, `uri = ""`) so the mint enters the list and AMM trades can be tracked immediately. The pipeline then does an **RPC metadata fetch** and will **rebroadcast** `token_launch` with real `name/symbol/uri` as soon as it can.
 
 - **Token metadata** (name, symbol, uri, creator, user, PDAs, curve state, etc.) comes **only** from:
-  - Live `token_launch` messages (topic `"launches"`), and
+  - Live `token_launch` messages (topic `"launches"` or per‑mint topic), and
   - `snapshot_launches` on connect.
 - **Trades, migrations, tickers** carry `mint`, price, volume, etc., but **do not** carry name/symbol/uri. Do not create or show a “token row” from a trade/migration/ticker alone without merging in launch data.
-- **Rule:** For any mint you display, maintain a **launch cache keyed by mint**. When you receive `token_launch` or an item from `snapshot_launches`, **upsert by mint** (create or replace). When you receive `trade`, `migration`, or `snapshot_tickers`, **update price/volume/state for that mint** but **never overwrite or ignore the launch payload** for that mint. If you don’t have launch data for a mint yet, show a placeholder (e.g. “Loading…” or mint shorthand) until a `token_launch` or `snapshot_launches` provides it.
+- **Rule (backend invariant):**
+  - The backend **only sends trades/migrations/tickers for mints it has launched** (tracked Pump tokens).
+  - The backend **does not guarantee** that a `trade` for a mint is always delivered *after* the very first `token_launch` in every possible reconnect/subscription scenario.
+  - Instead, the backend guarantees that **whenever it knows token metadata, it will send `token_launch`** (snapshots on connect, live `token_launch`, and a one‑off per‑mint snapshot when you subscribe to a specific mint topic).
+- **Rule (frontend responsibility):** For any mint you display, maintain a **launch cache keyed by mint**:
+  - When you receive `token_launch` or an item from `snapshot_launches`, **upsert `launchCache[mint] = payload`** (create or replace). This cache is the only source of truth for `name/symbol/uri/creator/...`.
+  - When you receive `trade`, `migration`, or `snapshot_tickers`, **update price/volume/state for that mint** but **never overwrite or ignore the cached launch payload** for that mint.
+  - If `launchCache[mint]` is missing, you **must treat the token details as unknown** and:
+    - Render a placeholder (e.g. mint shorthand or “Loading…”), and
+    - Optionally call `/token?mint=<MINT>` as a backfill (see below).
 - **Fallback when WS is missed:** If you have a mint from `trade` / `migration` / `snapshot_tickers` but `launchCache[mint]` is still missing after a short grace period (e.g. 1–3 seconds), call the HTTP API to backfill metadata:
   - `GET /token?mint=<MINT>` → returns `{ name, symbol, uri, creator }` from ClickHouse `token_launches` (latest by received_at).
   - Then upsert into your `launchCache[mint]` (and keep waiting for WS `token_launch` as the authoritative full payload).
 
 ---
 
-## Message types (what to render)
+## Message types (what to render and how to join)
 
 ### 1. `connected`
 
@@ -103,7 +112,7 @@ The server does not send acks for subscribe/unsubscribe; just start / stop getti
 
 Use only for logging / debugging.
 
-### 2. `snapshot_*` on connect
+### 2. `snapshot_*` on connect (initial state)
 
 - `snapshot_migrated`: list of `{ mint, pool, signature, slot }`.
 - `snapshot_soon_migrating`: list of `{ mint, progress_pct, virtual_token_reserves }`.
@@ -118,15 +127,15 @@ Use only for logging / debugging.
   - `last_slot`
   - `migrated_to_pool?`
 
-**Recommended UI flow on connect:**
+**Recommended UI flow on connect: strict state reset**
 
 - Replace your in‑memory state with these snapshots (don’t merge heuristically).
 - Use `snapshot_tickers` to populate the main list (no blank screen).
 - Use `snapshot_launches` / `snapshot_trades` to backfill feeds.
 
-### Frontend implementation: token details and list state (replace existing logic)
+### Frontend implementation: token details and list state
 
-Follow these steps so mints never appear without token details.
+Follow these steps so mints never appear without token details **once the pipeline has sent a launch for them**, while still behaving correctly if a trade is seen before launch due to reconnects.
 
 1. **State**
    - Keep a **launch cache**: `Map<mint, TokenLaunchPayload>` (or equivalent). This is the source of truth for `name`, `symbol`, `uri`, `creator`, `user`, `pump_accounts`, `initial_bonding_curve_state`, etc.
@@ -134,16 +143,28 @@ Follow these steps so mints never appear without token details.
 
 2. **On connect (snapshots)**
    - When you receive **`snapshot_launches`**, for each item in the array: **set `launchCache[item.mint] = item`** (replace if already present). Do not skip; do not merge only “new” fields.
-   - When you receive **`snapshot_trades`** or **`snapshot_tickers`**, update your trade/ticker state by mint. For the UI, **for each mint you display**, resolve display name/symbol/uri from **`launchCache.get(mint)`**. If missing, show a placeholder (e.g. mint slice or “Loading…”) until a launch for that mint appears.
+   - When you receive **`snapshot_trades`** or **`snapshot_tickers`**, update your trade/ticker state by mint. For the UI, **for each mint you display**, resolve display name/symbol/uri from **`launchCache.get(mint)`**:
+     - If present, use it for name/symbol/uri/etc.
+     - If missing, show a placeholder (e.g. mint slice or “Loading…”) until a launch for that mint appears or `/token` returns details.
 
 3. **Live `token_launch`**
-   - On every **`token_launch`** message: **set `launchCache[data.mint] = data`** (full replace). Then update the list/card for that mint so the row shows `data.name`, `data.symbol`, `data.uri`, etc. This applies to both the initial launch and the re-sent launch before a migration (which may only update price/mcap/liquidity; keep existing name/symbol/uri if you merge, or prefer the cached launch payload as above).
+   - On every **`token_launch`** message: **set `launchCache[data.mint] = data`** (full replace). Then update the list/card for that mint so the row shows `data.name`, `data.symbol`, `data.uri`, etc.
+   - This applies to:
+     - The initial launch.
+     - Any later `token_launch` rebroadcasts (e.g. after RPC metadata fetch or before a migration). Treat them as authoritative and overwrite your cache.
 
 4. **Live `trade` / `migration` / `ohclv`**
-   - Update price, volume, and migration state by mint. **Do not** create a new list entry from a trade or migration alone. If you add a row for a new mint when you see a trade/migration, that row must show token details from **`launchCache.get(mint)`**; if the cache has no entry, show a placeholder until a `token_launch` (or a later `snapshot_launches`) fills it.
+   - Update price, volume, and migration state by mint.
+   - **Do not** create a new list entry from a trade or migration alone and assume you have full token details.
+   - If you add a row for a new mint when you see a trade/migration:
+     - Use `launchCache.get(mint)` for token details if present.
+     - If `launchCache[mint]` is missing, render the row with:
+       - A placeholder name/symbol/uri (e.g. truncated mint), and
+       - A loading state while you wait for `token_launch` / `snapshot_launches` or `/token`.
 
 5. **Display rule**
-   - For any “new tokens” or “launches” list: **only show mints that exist in `launchCache`**, or if you show mints from tickers/trades first, **render name/symbol/uri from `launchCache`** and never from trade/ticker (they don’t carry it). Replacing existing logic with this flow ensures you never show a mint with empty token details when the pipeline has already sent a launch for it.
+   - For any “new tokens” or “launches” list: **prefer mints that exist in `launchCache`**.
+   - If you show mints from tickers/trades first, **render name/symbol/uri strictly from `launchCache`** and never from trade/ticker (they don’t carry it). If the cache is missing, display the mint as a placeholder and backfill details via WS (`token_launch`) or HTTP (`/token`).
 
 ### 3. `token_launch`
 
