@@ -339,145 +339,101 @@ fn build_token_launch_from_event(
     })
 }
 
-/// Extract token launch in a robust order: 1) CreateEvent from logs, 2) Create/CreateV2 instruction, 3) fallback logs.
+/// Extract token launch in a strict order for reliable name/symbol/uri:
+/// 1) CreateEvent from logs (Program data: with CreateEvent discriminator)
+/// 2) Create/CreateV2 instruction data (ix.data: length-prefixed name, symbol, uri per IDL)
+/// 3) Logs fallback (CreateEvent from logs again when ix.data missing or decode failed)
 pub fn parse_create(ix: &InstructionUpdate, received_at: u64) -> Option<crate::events::TokenLaunch> {
     let signature = bs58::encode(ix.shared.signature.as_slice()).into_string();
 
-    // 1. CreateEvent — from logs first (most robust; same tx logs on every Pump.fun ix).
-    if let Some(parsed) = try_parse_create_event_from_logs(ix) {
-        let (abc, g) = if is_create_instruction(ix) {
-            (
-                ix.accounts.get(3).map(|p| bs58::encode(&p.0).into_string()),
-                ix.accounts.get(4).map(|p| bs58::encode(&p.0).into_string()),
-            )
-        } else {
-            (None, None)
-        };
-        if let Some(mut launch) = build_token_launch(
-            ix,
-            &signature,
-            parsed.timestamp_millis,
-            received_at,
-            true,
-            parsed.name,
-            parsed.symbol,
-            parsed.uri,
-            parsed.mint,
-            parsed.creator,
-            Some(parsed.bonding_curve),
-            abc,
-            g,
-        ) {
-            launch.initial_bonding_curve_state = parsed.initial_bonding_curve_state;
-            launch.user = parsed.user;
-            launch.token_total_supply = parsed.token_total_supply;
-            launch.token_program = parsed.token_program;
-            launch.is_mayhem_mode = parsed.is_mayhem_mode;
+    // 1. CreateEvent from logs — Program data with CreateEvent discriminator.
+    if let Some(launch) = try_build_launch_from_create_event(ix, &signature, received_at) {
+        return Some(launch);
+    }
+
+    // 2. Create/CreateV2 instruction data — name, symbol, uri from ix.data (IDL layout).
+    if has_create_in_logs(ix) && is_create_instruction(ix) {
+        if let Some(launch) = try_build_launch_from_instruction_data(ix, &signature, received_at) {
             return Some(launch);
         }
     }
 
-    // 2. Create/CreateV2 instruction — use ix.data and accounts when Geyser gives us the Create ix.
-    let txn_timestamp = txn_timestamp_from_create_logs(ix).unwrap_or(received_at / 1000);
-    if has_create_in_logs(ix) && is_create_instruction(ix) {
-        let is_token_2022 = ix.data.len() >= 8 && ix.data[0..8] == CREATE_V2_DISCRIMINATOR;
-
-        let data = &ix.data;
-        if data.len() >= 8 {
-            let mut offset = 8;
-            if let (Some(n), Some(s), Some(u)) = (
-                read_length_prefixed_string(data, &mut offset),
-                read_length_prefixed_string(data, &mut offset),
-                read_length_prefixed_string(data, &mut offset),
-            ) {
-                if offset + 32 <= data.len() {
-                    let c = bs58::encode(&data[offset..offset + 32]).into_string();
-                    let m = ix.accounts.get(0).map(|p| bs58::encode(&p.0).into_string()).unwrap_or_default();
-                    let bc = ix.accounts.get(2).map(|p| bs58::encode(&p.0).into_string());
-                    let abc = ix.accounts.get(3).map(|p| bs58::encode(&p.0).into_string());
-                    let g = ix.accounts.get(4).map(|p| bs58::encode(&p.0).into_string());
-                    if !m.is_empty() || !n.is_empty() || !s.is_empty() || !u.is_empty() {
-                        if let Some(launch) = build_token_launch(
-                            ix,
-                            &signature,
-                            txn_timestamp,
-                            received_at,
-                            is_token_2022,
-                            n,
-                            s,
-                            u,
-                            m,
-                            c,
-                            bc,
-                            abc,
-                            g,
-                        ) {
-                            return Some(launch);
-                        }
-                    }
-                }
-            }
-        }
-
-        if is_token_2022 {
-            if let Some(parsed) = try_parse_create_event_from_logs(ix) {
-                let abc = ix.accounts.get(3).map(|p| bs58::encode(&p.0).into_string());
-                let g = ix.accounts.get(4).map(|p| bs58::encode(&p.0).into_string());
-                if let Some(mut launch) = build_token_launch(
-                    ix,
-                    &signature,
-                    parsed.timestamp_millis,
-                    received_at,
-                    true,
-                    parsed.name,
-                    parsed.symbol,
-                    parsed.uri,
-                    parsed.mint,
-                    parsed.creator,
-                    Some(parsed.bonding_curve),
-                    abc,
-                    g,
-                ) {
-                    launch.initial_bonding_curve_state = parsed.initial_bonding_curve_state;
-                    launch.user = parsed.user;
-                    launch.token_total_supply = parsed.token_total_supply;
-                    launch.token_program = parsed.token_program;
-                    launch.is_mayhem_mode = parsed.is_mayhem_mode;
-                    return Some(launch);
-                }
-            }
-        }
-    }
-
-    // 3. Fallback for logs — CreateV2 in logs but not Create ix (e.g. Buy in same tx); Geyser didn't give Create ix.data.
-    if has_create_v2_in_logs(ix) {
-        if let Some(parsed) = try_parse_create_event_from_logs(ix) {
-            if let Some(mut launch) = build_token_launch(
-                ix,
-                &signature,
-                parsed.timestamp_millis,
-                received_at,
-                true,
-                parsed.name,
-                parsed.symbol,
-                parsed.uri,
-                parsed.mint,
-                parsed.creator,
-                Some(parsed.bonding_curve),
-                None,
-                None,
-            ) {
-                launch.initial_bonding_curve_state = parsed.initial_bonding_curve_state;
-                launch.user = parsed.user;
-                launch.token_total_supply = parsed.token_total_supply;
-                launch.token_program = parsed.token_program;
-                launch.is_mayhem_mode = parsed.is_mayhem_mode;
-                return Some(launch);
-            }
+    // 3. Logs fallback — CreateEvent from logs again (e.g. CreateV2 in logs but no Create ix, or ix.data decode failed).
+    if has_create_in_logs(ix) || has_create_v2_in_logs(ix) {
+        if let Some(launch) = try_build_launch_from_create_event(ix, &signature, received_at) {
+            return Some(launch);
         }
     }
 
     None
+}
+
+/// Build TokenLaunch from CreateEvent parsed from "Program data:" logs.
+fn try_build_launch_from_create_event(
+    ix: &InstructionUpdate,
+    signature: &str,
+    received_at: u64,
+) -> Option<crate::events::TokenLaunch> {
+    let parsed = try_parse_create_event_from_logs(ix)?;
+    let (abc, g) = if is_create_instruction(ix) {
+        (
+            ix.accounts.get(3).map(|p| bs58::encode(&p.0).into_string()),
+            ix.accounts.get(4).map(|p| bs58::encode(&p.0).into_string()),
+        )
+    } else {
+        (None, None)
+    };
+    let mut launch = build_token_launch(
+        ix,
+        signature,
+        parsed.timestamp_millis,
+        received_at,
+        true,
+        parsed.name,
+        parsed.symbol,
+        parsed.uri,
+        parsed.mint,
+        parsed.creator,
+        Some(parsed.bonding_curve),
+        abc,
+        g,
+    )?;
+    launch.initial_bonding_curve_state = parsed.initial_bonding_curve_state;
+    launch.user = parsed.user;
+    launch.token_total_supply = parsed.token_total_supply;
+    launch.token_program = parsed.token_program;
+    launch.is_mayhem_mode = parsed.is_mayhem_mode;
+    Some(launch)
+}
+
+/// Build TokenLaunch from Create/CreateV2 instruction data (name, symbol, uri + creator from ix.data).
+fn try_build_launch_from_instruction_data(
+    ix: &InstructionUpdate,
+    signature: &str,
+    received_at: u64,
+) -> Option<crate::events::TokenLaunch> {
+    let data = &ix.data;
+    if data.len() < 8 {
+        return None;
+    }
+    let is_token_2022 = data[0..8] == CREATE_V2_DISCRIMINATOR;
+    let txn_timestamp = txn_timestamp_from_create_logs(ix).unwrap_or(received_at / 1000);
+    let mut offset = 8;
+    let n = read_length_prefixed_string(data, &mut offset)?;
+    let s = read_length_prefixed_string(data, &mut offset)?;
+    let u = read_length_prefixed_string(data, &mut offset)?;
+    if offset + 32 > data.len() {
+        return None;
+    }
+    let c = bs58::encode(&data[offset..offset + 32]).into_string();
+    let m = ix.accounts.get(0).map(|p| bs58::encode(&p.0).into_string()).unwrap_or_default();
+    let bc = ix.accounts.get(2).map(|p| bs58::encode(&p.0).into_string());
+    let abc = ix.accounts.get(3).map(|p| bs58::encode(&p.0).into_string());
+    let g = ix.accounts.get(4).map(|p| bs58::encode(&p.0).into_string());
+    if m.is_empty() && n.is_empty() && s.is_empty() && u.is_empty() {
+        return None;
+    }
+    build_token_launch(ix, signature, txn_timestamp, received_at, is_token_2022, n, s, u, m, c, bc, abc, g)
 }
 
 fn build_token_launch(

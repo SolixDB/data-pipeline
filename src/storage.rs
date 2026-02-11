@@ -17,6 +17,8 @@ use tracing::{info, warn};
 const INITIAL_VIRTUAL_TOKEN_RESERVES: u64 = 1_073_000_000_000_000;
 const SOON_MIGRATING_PROGRESS_PCT: f64 = 75.0;
 const MAX_RECENT_MIGRATIONS: usize = 10_000;
+/// Minimum number of migrated (and soon_migrating) entries to keep in snapshot; avoid removing too instantly.
+const SNAPSHOT_MIGRATION_BUFFER: usize = 30;
 const BATCH_SIZE: usize = 5000;
 const FLUSH_INTERVAL_MS: u64 = 50;
 const REDIS_KEY_BONDING_CURVES: &str = "bonding_curves";
@@ -733,7 +735,9 @@ pub fn spawn_storage_worker(
                         slot: migration.slot,
                     });
 
-                    while migrated_list.len() > MAX_RECENT_MIGRATIONS {
+                    while migrated_list.len() > MAX_RECENT_MIGRATIONS
+                        && migrated_list.len() > SNAPSHOT_MIGRATION_BUFFER
+                    {
                         migrated_list.remove(0);
                     }
                 }
