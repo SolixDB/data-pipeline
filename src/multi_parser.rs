@@ -72,6 +72,7 @@ pub fn parse_token_launches(
     out
 }
 
+/// Trades: 1) TradeEvent (pump_fun) / buyEvent/sellEvent (pump_amm) from logs, 2) Geyser ix data, 3) fallback logs.
 pub fn parse_trade_events(
     instructions: &[InstructionUpdate],
     parser_map: &HashMap<Vec<u8>, &'static str>,

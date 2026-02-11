@@ -18,6 +18,10 @@ const CREATE_V2_DISCRIMINATOR: [u8; 8] = [0xd6, 0x90, 0x4c, 0xec, 0x5f, 0x8b, 0x
 const CREATE_EVENT_DISCRIMINATOR: [u8; 8] = [27, 114, 169, 77, 222, 235, 99, 118];
 /// Anchor event discriminator for createEvent (camelCase): first 8 bytes of sha256("event:createEvent").
 const CREATE_EVENT_DISCRIMINATOR_CAMEL: [u8; 8] = [161, 122, 54, 229, 163, 163, 105, 102];
+/// Anchor event discriminator for TradeEvent (PascalCase): first 8 bytes of sha256("event:TradeEvent").
+const TRADE_EVENT_DISCRIMINATOR: [u8; 8] = [189, 219, 127, 211, 78, 230, 97, 238];
+/// Anchor event discriminator for tradeEvent (camelCase): first 8 bytes of sha256("event:tradeEvent").
+const TRADE_EVENT_DISCRIMINATOR_CAMEL: [u8; 8] = [146, 67, 97, 247, 238, 217, 202, 38];
 
 fn is_create_instruction(ix: &InstructionUpdate) -> bool {
     ix.data.len() >= 8
@@ -552,39 +556,128 @@ fn decode_trade_event(
     })
 }
 
+/// Robust order: 1) TradeEvent from logs, 2) Geyser ix data, 3) fallback to program logs.
 pub fn parse_trade_events(ix: &InstructionUpdate, received_at: u64) -> Vec<crate::events::Trade> {
     use base64::Engine;
     let decoder = base64::engine::general_purpose::STANDARD;
     let signature = bs58::encode(ix.shared.signature.as_slice()).into_string();
     let is_create = has_create_in_logs(ix);
-
-    // Extract bonding curve address from accounts (accounts[2] per IDL)
     let bonding_curve = ix.accounts.get(2).map(|p| bs58::encode(&p.0).into_string());
-
     let mut out = Vec::new();
+
+    // 1. TradeEvent — from program logs (primary; validate discriminator).
     for log in &ix.shared.log_messages {
-        let Some(data_str) = log.strip_prefix("Program data: ") else {
-            continue;
+        let data_str = match program_data_payload(log) {
+            Some(s) => s,
+            None => continue,
         };
-        let Ok(data) = decoder.decode(data_str.trim()) else {
+        let data = match decoder.decode(data_str) {
+            Ok(d) => d,
+            Err(_) => continue,
+        };
+        if data.len() < TRADE_EVENT_MIN_SIZE {
             continue;
+        }
+        let disc = &data[0..8];
+        if disc != TRADE_EVENT_DISCRIMINATOR && disc != TRADE_EVENT_DISCRIMINATOR_CAMEL {
+            continue;
+        }
+        if let Some(trade) = decode_trade_event(&data, &signature, ix.shared.slot, is_create, bonding_curve.as_deref(), received_at) {
+            out.push(trade);
+        }
+    }
+    if !out.is_empty() {
+        return out;
+    }
+
+    // 2. Geyser ix data — parse from instruction when Buy/Sell discriminator present (best-effort).
+    if has_trade_in_logs(ix) && ix.data.len() >= 8 {
+        if let Some(trade) = try_parse_trade_from_ix_data(ix, &signature, is_create, bonding_curve.as_deref(), received_at) {
+            out.push(trade);
+            return out;
+        }
+    }
+
+    // 3. Fallback — program logs without strict discriminator.
+    for log in &ix.shared.log_messages {
+        let data_str = match program_data_payload(log) {
+            Some(s) => s,
+            None => continue,
+        };
+        let data = match decoder.decode(data_str) {
+            Ok(d) => d,
+            Err(_) => continue,
         };
         if let Some(trade) = decode_trade_event(&data, &signature, ix.shared.slot, is_create, bonding_curve.as_deref(), received_at) {
-            if trade.pool.is_none() {
-                tracing::debug!(
-                    "Parsed Pump.fun trade with NULL pool (bonding_curve not found in accounts). Signature: {}, Accounts len: {}", 
-                    signature, 
-                    ix.accounts.len()
-                );
-                // Log accounts to see what we have
-                for (i, acc) in ix.accounts.iter().enumerate() {
-                    tracing::debug!("Account {}: {}", i, bs58::encode(&acc.0).into_string());
-                }
-            }
             out.push(trade);
         }
     }
     out
+}
+
+/// Try to build a Trade from Geyser instruction data (Buy/Sell). Best-effort when event logs missing.
+fn try_parse_trade_from_ix_data(
+    ix: &InstructionUpdate,
+    signature: &str,
+    is_create: bool,
+    bonding_curve: Option<&str>,
+    received_at: u64,
+) -> Option<crate::events::Trade> {
+    const BUY_DISCRIMINATOR: [u8; 8] = [102, 6, 61, 18, 1, 218, 235, 234];
+    const SELL_DISCRIMINATOR: [u8; 8] = [51, 230, 133, 164, 1, 127, 131, 173];
+    let data = &ix.data;
+    if data.len() < 8 + 8 {
+        return None;
+    }
+    let disc = &data[0..8];
+    let is_buy = disc == BUY_DISCRIMINATOR;
+    let is_sell = disc == SELL_DISCRIMINATOR;
+    if !is_buy && !is_sell {
+        return None;
+    }
+    let mint = ix.accounts.get(2).map(|p| bs58::encode(&p.0).into_string())?;
+    let token_amount = u64::from_le_bytes(data[8..16].try_into().ok()?);
+    let sol_amount = 0u64;
+    use crate::events::{Trade, TradeDirection};
+    let trader = ix.accounts.get(4).map(|p| bs58::encode(&p.0).into_string()).unwrap_or_default();
+    Some(Trade {
+        signature: signature.to_string(),
+        slot: ix.shared.slot,
+        mint,
+        trader,
+        direction: if is_buy { TradeDirection::Buy } else { TradeDirection::Sell },
+        token_amount,
+        sol_amount,
+        virtual_sol_reserves: 0,
+        virtual_token_reserves: 0,
+        real_sol_reserves: 0,
+        real_token_reserves: 0,
+        price: 0.0,
+        market_cap: 0.0,
+        liquidity_sol: 0.0,
+        fee: 0,
+        is_create,
+        is_bonding_curve: true,
+        pool: bonding_curve.map(|s| s.to_string()),
+        suggested_compute_unit_limit: 300_000,
+        token_decimals: 6,
+        txn_timestamp: received_at / 1000,
+        received_at,
+        sent_at: 0,
+        volume_sol: 0.0,
+        volume_5m: 0.0,
+        volume_1h: 0.0,
+        volume_6h: 0.0,
+        tx_count: 0,
+        tx_count_5m: 0,
+        tx_count_1h: 0,
+        tx_count_6h: 0,
+        price_change_5m: 0.0,
+        price_change_1h: 0.0,
+        price_change_6h: 0.0,
+        price_change_24h: 0.0,
+        total_fees_sol: 0.0,
+    })
 }
 
 fn decode_migration_event(

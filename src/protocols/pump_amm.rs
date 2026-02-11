@@ -11,6 +11,19 @@ const SELL_SOL_OFF: usize = 56;
 const SELL_POOL_BASE_OFF: usize = 40;
 const SELL_POOL_QUOTE_OFF: usize = 48;
 
+/// Anchor event discriminator: first 8 bytes of sha256("event:buyEvent").
+const BUY_EVENT_DISCRIMINATOR: [u8; 8] = [239, 95, 203, 206, 161, 114, 144, 248];
+/// Anchor event discriminator: first 8 bytes of sha256("event:sellEvent").
+const SELL_EVENT_DISCRIMINATOR: [u8; 8] = [38, 126, 39, 120, 33, 101, 62, 244];
+
+fn program_data_payload(log_line: &str) -> Option<&str> {
+    const PREFIX: &str = "Program data: ";
+    let line = log_line.trim();
+    line.find(PREFIX)
+        .map(|i| &line[i + PREFIX.len()..])
+        .map(|s| s.trim())
+}
+
 pub fn has_buy_in_logs(ix: &InstructionUpdate) -> bool {
     ix.shared.log_messages.iter().any(|l| {
         l.contains("Instruction: Buy") || l.contains("Instruction: BuyExactQuoteIn")
@@ -209,6 +222,7 @@ fn extract_mint_from_ix(ix: &InstructionUpdate) -> Option<String> {
     None
 }
 
+/// Robust order: 1) buyEvent/sellEvent from logs, 2) Geyser ix data, 3) fallback to program logs.
 pub fn parse_amm_trade_events(ix: &InstructionUpdate, received_at: u64) -> Vec<Trade> {
     use base64::Engine;
     let decoder = base64::engine::general_purpose::STANDARD;
@@ -217,12 +231,10 @@ pub fn parse_amm_trade_events(ix: &InstructionUpdate, received_at: u64) -> Vec<T
     if ix.accounts.len() < 4 {
         return vec![];
     }
-
     let mint = match extract_mint_from_ix(ix) {
         Some(m) => m,
         None => return vec![],
     };
-
     let is_buy = has_buy_in_logs(ix);
     let is_sell = has_sell_in_logs(ix);
     if !is_buy && !is_sell {
@@ -230,18 +242,53 @@ pub fn parse_amm_trade_events(ix: &InstructionUpdate, received_at: u64) -> Vec<T
     }
 
     let mut out = Vec::new();
+
+    // 1. buyEvent / sellEvent — from program logs (primary; validate discriminator).
     for log in &ix.shared.log_messages {
-        let Some(data_str) = log.strip_prefix("Program data: ") else {
-            continue;
+        let data_str = match program_data_payload(log) {
+            Some(s) => s,
+            None => continue,
         };
-        let Ok(data) = decoder.decode(data_str.trim()) else {
-            continue;
+        let data = match decoder.decode(data_str) {
+            Ok(d) => d,
+            Err(_) => continue,
         };
         if data.len() < 8 + AMM_EVENT_MIN_SIZE {
             continue;
-        };
+        }
+        let disc = &data[0..8];
         let payload = &data[8..];
+        if disc == BUY_EVENT_DISCRIMINATOR && is_buy {
+            if let Some(t) = decode_buy_event(payload, &signature, ix.shared.slot, &mint, received_at) {
+                out.push(t);
+                return out;
+            }
+        }
+        if disc == SELL_EVENT_DISCRIMINATOR && is_sell {
+            if let Some(t) = decode_sell_event(payload, &signature, ix.shared.slot, &mint, received_at) {
+                out.push(t);
+                return out;
+            }
+        }
+    }
 
+    // 2. Geyser ix data — would require Buy/Sell instruction layout; skip for AMM (events are reliable).
+    // (Optional: add try_parse_amm_trade_from_ix_data if needed.)
+
+    // 3. Fallback — program logs without strict discriminator.
+    for log in &ix.shared.log_messages {
+        let data_str = match program_data_payload(log) {
+            Some(s) => s,
+            None => continue,
+        };
+        let data = match decoder.decode(data_str) {
+            Ok(d) => d,
+            Err(_) => continue,
+        };
+        if data.len() < 8 + AMM_EVENT_MIN_SIZE {
+            continue;
+        }
+        let payload = &data[8..];
         if is_buy {
             if let Some(t) = decode_buy_event(payload, &signature, ix.shared.slot, &mint, received_at) {
                 out.push(t);
