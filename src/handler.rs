@@ -325,94 +325,14 @@ async fn handle_transaction(
     let received_at = unix_timestamp_micros();
 
     // Parse migrations early so PumpAMM CreatePool can be treated as a token launch (so trades are tracked).
+    // NOTE: PumpAMM-derived token launches are temporarily disabled. We still parse migrations
+    // so that downstream migration handling and metrics remain intact.
     let migrations = multi_parser::parse_migration_events(&instructions, parser_map, received_at);
-
-    let known_now: HashSet<String> = known_mints.read().await.clone();
-    let cached_launches: HashSet<String> = if let Some(ref state_lock) = snapshot_state {
-        let r = state_lock.read().await;
-        r.latest_launch_by_mint.keys().cloned().collect()
-    } else {
-        HashSet::new()
-    };
-
-    let mut amm_launches: Vec<crate::events::TokenLaunch> = Vec::new();
-    for m in &migrations {
-        // CreatePoolEvent from pump_amm: when the mint isn't known yet, treat it as a new token launch.
-        if m.quote_mint.is_none() {
-            continue;
-        }
-        if m.mint.is_empty() {
-            continue;
-        }
-        if known_now.contains(&m.mint) || cached_launches.contains(&m.mint) {
-            continue;
-        }
-
-        // If we already know a bonding curve for this mint (Redis), this CreatePool is a Pump.fun -> AMM migration,
-        // not an AMM-direct launch.
-        let mut has_bonding_curve = false;
-        if let Some(ref r) = redis_client {
-            if let Ok(mut conn) = r.get_multiplexed_async_connection().await {
-                if let Ok(bc) = conn.hget::<_, _, String>("bonding_curves", &m.mint).await {
-                    has_bonding_curve = !bc.is_empty();
-                }
-            }
-        }
-        if has_bonding_curve {
-            continue;
-        }
-
-        let creator = m
-            .coin_creator
-            .clone()
-            .unwrap_or_else(|| if !m.user.is_empty() { m.user.clone() } else { String::new() });
-
-        let metadata = Pubkey::from_str(&m.mint).ok().map(|mint_pubkey| {
-            let metadata_program_id =
-                Pubkey::from_str("metaqbxxUerdq28cj1RbAWkYQm3ybzjb6a8bt518x1s").unwrap_or_default();
-            let (metadata_pda, _) = Pubkey::find_program_address(
-                &[b"metadata", metadata_program_id.as_ref(), mint_pubkey.as_ref()],
-                &metadata_program_id,
-            );
-            metadata_pda.to_string()
-        });
-
-        amm_launches.push(crate::events::TokenLaunch {
-            signature: m.signature.clone(),
-            slot: m.slot,
-            mint: m.mint.clone(),
-            // Placeholder: we'll fetch real metadata over RPC asap and rebroadcast.
-            name: m.mint.clone(),
-            symbol: String::new(),
-            uri: String::new(),
-            creator: creator.clone(),
-            user: creator,
-            pump_accounts: crate::events::PumpFunBondingCurveAccounts {
-                bonding_curve: None,
-                associated_bonding_curve: None,
-                global: None,
-                fee_recipient: None,
-                metadata,
-                creator_vault: None,
-                fee_config: None,
-                event_authority: None,
-            },
-            token_decimals: 6,
-            initial_bonding_curve_state: None,
-            pump_constants: crate::events::PumpProtocolConstants::default(),
-            security: None,
-            is_token_2022: false,
-            txn_timestamp: m.txn_timestamp,
-            received_at,
-            sent_at: 0,
-            token_total_supply: None,
-            token_program: None,
-            is_mayhem_mode: m.is_mayhem_mode,
-        });
-    }
+    // If you need to re-enable PumpAMM direct launches, restore the logic that:
+    //   - builds `amm_launches` from `migrations`, and
+    //   - extends `launches` with those inferred launches.
 
     let mut launches = multi_parser::parse_token_launches(&instructions, parser_map, received_at);
-    launches.extend(amm_launches);
     let mut trades = multi_parser::parse_trade_events(&instructions, parser_map, received_at);
     multi_parser::enrich_token_launches(&instructions, parser_map, &mut launches, &trades);
 
