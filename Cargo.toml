@@ -72,6 +72,8 @@ solana-message = "3.1.0"
 # Logging
 log = "0.4"
 env_logger = "0.11"
+# Security: force patched version (CVE stack exhaustion in < 0.3.47)
+time = "0.3.47"
 
 # Internal
 yellowstone-vixen-core = { path = "crates/core", version = "0.1.0" }
@@ -138,6 +140,7 @@ solana-message.workspace = true
 # Logging
 log.workspace = true
 env_logger.workspace = true
+time.workspace = true
 
 # Internal
 yellowstone-vixen-core.workspace = true
