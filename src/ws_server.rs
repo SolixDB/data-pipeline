@@ -308,8 +308,8 @@ async fn handle_connection(
 
                                         // On first subscribe to a mint-like topic, proactively send the latest
                                         // TokenLaunchPayload so the client has token details before any trades.
-                                        // We skip special aggregate topics like \"launches\" and \"tickers\".
-                                        if is_new && topic != \"launches\" && topic != \"tickers\" {
+                                        // We skip special aggregate topics like "launches" and "tickers".
+                                        if is_new && topic != "launches" && topic != "tickers" {
                                             if let Some(ref state_lock) = server.snapshot_state {
                                                 let launch_opt = {
                                                     let snap = state_lock.read().await;
@@ -330,7 +330,7 @@ async fn handle_connection(
                                         }
                                     }
                                     debug!(
-                                        \"Client {} subscribed to {} topics\",
+                                        "Client {} subscribed to {} topics",
                                         client_id,
                                         subscriptions.len()
                                     );
@@ -340,7 +340,7 @@ async fn handle_connection(
                                         subscriptions.remove(&t);
                                     }
                                     debug!(
-                                        \"Client {} unsubscribed, remaining: {}\",
+                                        "Client {} unsubscribed, remaining: {}",
                                         client_id,
                                         subscriptions.len()
                                     );
