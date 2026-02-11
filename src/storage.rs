@@ -367,6 +367,9 @@ pub const REDIS_KEY_SOON_MIGRATING: &str = "snapshot:soon_migrating";
 pub const REDIS_KEY_LAUNCHES: &str = "snapshot:launches";
 pub const REDIS_KEY_TRADES: &str = "snapshot:trades";
 
+/// (mint, creator, received_at_micros). Kept for a short window so dev-buy trades can be tagged even if they arrive before snapshot is updated.
+pub const RECENT_LAUNCHES_WINDOW_MICROS: u64 = 15_000_000; // 15 seconds
+
 #[derive(Clone, Default)]
 pub struct SnapshotState {
     pub migrated: Vec<MigratedEntry>,
@@ -376,6 +379,8 @@ pub struct SnapshotState {
     pub tickers: HashMap<String, TokenState>,
     pub last_processed_slot: u64,
     pub last_processed_tx_index: u64,
+    /// Recent (mint, creator, received_at_micros) for dev-buy lookup; pruned when older than RECENT_LAUNCHES_WINDOW_MICROS.
+    pub recent_launches: VecDeque<(String, String, u64)>,
 }
 
 async fn flush_with_retry<F, Fut>(mut f: F)

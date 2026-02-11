@@ -122,6 +122,8 @@ pub struct Trade {
     pub liquidity_sol: f64,
     pub fee: u64,
     pub is_create: bool,
+    #[serde(default)]
+    pub is_dev_buy: bool,
     #[serde(default = "default_true")]
     pub is_bonding_curve: bool,
     #[serde(default)]

@@ -270,8 +270,36 @@ async fn handle_transaction(
     let received_at = unix_timestamp_micros();
 
     let mut launches = multi_parser::parse_token_launches(&instructions, parser_map, received_at);
-    let trades = multi_parser::parse_trade_events(&instructions, parser_map, received_at);
+    let mut trades = multi_parser::parse_trade_events(&instructions, parser_map, received_at);
     multi_parser::enrich_token_launches(&instructions, parser_map, &mut launches, &trades);
+
+    // Mint -> creator so we can mark dev buy (trader == creator); frontend can show mcap when only dev bought.
+    let mut mint_creator: HashMap<String, String> = HashMap::new();
+    for launch in &launches {
+        mint_creator.insert(launch.mint.clone(), launch.creator.clone());
+    }
+    if let Some(ref state_lock) = snapshot_state {
+        let mut w = state_lock.write().await;
+        for launch in &launches {
+            w.recent_launches.push_back((launch.mint.clone(), launch.creator.clone(), received_at));
+        }
+        let cutoff = received_at.saturating_sub(crate::storage::RECENT_LAUNCHES_WINDOW_MICROS);
+        while w.recent_launches.front().map(|(_, _, ts)| *ts < cutoff).unwrap_or(false) {
+            w.recent_launches.pop_front();
+        }
+        for (mint, creator, _) in &w.recent_launches {
+            mint_creator.entry(mint.clone()).or_insert_with(|| creator.clone());
+        }
+        for l in &w.launches {
+            mint_creator.entry(l.mint.clone()).or_insert_with(|| l.creator.clone());
+        }
+    }
+    for trade in &mut trades {
+        trade.is_dev_buy = mint_creator
+            .get(&trade.mint)
+            .map(|c| c == &trade.trader)
+            .unwrap_or(false);
+    }
 
     for mut launch in launches {
         let has_display_data = !launch.mint.is_empty()
@@ -285,6 +313,9 @@ async fn handle_transaction(
             );
             continue;
         }
+
+        // Add to known_mints immediately so trades in this tx (e.g. dev buy) are not skipped.
+        known_mints.write().await.insert(launch.mint.clone());
 
         let count = launch_count.fetch_add(1, Ordering::Relaxed) + 1;
         let log_msg = format!(
@@ -346,7 +377,6 @@ async fn handle_transaction(
 
         let metrics_client_bg = metrics_client.clone();
         let storage_tx_bg = storage_tx.clone();
-        let known_mints_bg = known_mints.clone();
         let redis_client_bg = redis_client.clone();
         let ws_server_bg = ws_server.clone();
         let rpc_url_bg = rpc_url.map(|s| s.to_string());
@@ -411,19 +441,15 @@ async fn handle_transaction(
                     }
                 }
             }
-
-            known_mints_bg
-                .write()
-                .await
-                .insert(mint_for_tracking_bg);
         });
     }
 
+    // Only send trades for mints we've sent a launch for (known_mints is updated synchronously above).
     for mut trade in trades {
         let mut migration_event: Option<Migration> = None;
         if !known_mints.read().await.contains(&trade.mint) {
-             continue;
-         }
+            continue;
+        }
 
         let mut finalized_candle: Option<crate::events::Ohclv> = None;
         if trade.is_bonding_curve && trade.pool.is_none() {

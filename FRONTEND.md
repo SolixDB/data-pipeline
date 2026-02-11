@@ -165,6 +165,7 @@ Key fields:
 - `price_change_*`
 - `total_fees_sol`
 - `is_bonding_curve`, `pool?`
+- `is_dev_buy` (bool): `true` when `trader` is the token creator. Use this to **show market cap even when only the dev has bought** (no other trades yet); otherwise the UI might show mcap as nil.
 
 **Volume semantics:** All volume fields are in **SOL** (not lamports). They are rolling windows from **on-chain trade time** (5m, 1h, 6h, 24h). The pipeline deduplicates by transaction (same tx is never counted twice). Use `volume_sol` or `volume_24h` for “total volume” display; both are the 24h window.
 
