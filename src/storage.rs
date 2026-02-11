@@ -355,11 +355,13 @@ impl TokenState {
     }
 }
 
+/// Seconds to exclude from volume windows (trades in the last N seconds are not counted). Default 3.
+/// Set VOLUME_DISPLAY_DELAY_SECS=0 for instant volume; higher values align with delayed terminal feeds.
 pub fn volume_display_delay_secs() -> u64 {
     std::env::var("VOLUME_DISPLAY_DELAY_SECS")
         .ok()
         .and_then(|s| s.parse().ok())
-        .unwrap_or(10)
+        .unwrap_or(3)
 }
 
 pub const REDIS_KEY_MIGRATED: &str = "snapshot:migrated";

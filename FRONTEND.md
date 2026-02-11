@@ -214,7 +214,7 @@ Key fields:
 
 **Volume and market cap:**
 - **Market cap** is sent with the launch and with every trade **without awaiting** any slow work (security fetch, DB, Redis run in the background). So mcap appears as soon as we have it and matches Pump.fun.
-- **Volume** is computed **accurately** by recalculating from trade history (not incremental), with a configurable delay (default 10s via `VOLUME_DISPLAY_DELAY_SECS`) so the number aligns with terminal-style updates. You get volume in two ways:
+- **Volume** is computed **accurately** by recalculating from trade history (not incremental), with a configurable delay (default 3s via `VOLUME_DISPLAY_DELAY_SECS`; set to `0` for instant volume). You get volume in two ways:
   1. **On each trade:** the `trade` message includes delayed volume fields (`volume_sol`, `volume_5m`, etc.) so the UI can update on every trade (value excludes the last N seconds).
   2. **Periodic tickers:** subscribe to topic `"tickers"` to receive `snapshot_tickers` every N seconds with the same accurate delayed volume for all tokens. Prefer this for a single source of truth for volume if you want smooth, batched updates.
 

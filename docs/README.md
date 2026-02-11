@@ -149,6 +149,7 @@ cargo run --release
 | `HEALTH_GRPC_MAX_AGE_SECS` | 120 | Health returns 200 only if last gRPC activity is within this many seconds. |
 | `WS_INITIAL_SNAPSHOT_LAUNCH_LIMIT` | 50 | Max token launches in the snapshot sent to new WebSocket clients. |
 | `WS_INITIAL_SNAPSHOT_TRADE_LIMIT` | 1000 | Max trades (for those mints) in the snapshot. |
+| `VOLUME_DISPLAY_DELAY_SECS` | 3 | Seconds to exclude from volume windows (faster update). Set to `0` for instant volume. |
 | `RUST_LOG` | info | Log level (e.g. `debug`, `info`). |
 
 After start: WebSocket at `ws://0.0.0.0:<WS_PORT>`. If `HEALTH_PORT` is not 0, health at `http://0.0.0.0:<HEALTH_PORT>/health` (GET; 200 if gRPC activity is recent, else 503). Logs: `Connected to blockchain gRPC`, `WebSocket server listening on ws://...`, `Health server listening on 0.0.0.0:<port>` when health is enabled. Per-event lines are at `debug` level; use `RUST_LOG=debug` to see them.
