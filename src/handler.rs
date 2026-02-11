@@ -465,12 +465,33 @@ async fn handle_transaction(
         tokio::spawn(async move {
             if let Some(url) = rpc_url_bg.as_deref() {
                 let mint_for_security = launch_bg.mint.clone();
-                match tokio::time::timeout(
+
+                // Give the RPC node a moment to index the newly created mint account.
+                tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+
+                let mut sec_result = tokio::time::timeout(
                     std::time::Duration::from_millis(500),
                     crate::security::fetch_mint_security(url, &mint_for_security),
                 )
-                .await
-                {
+                .await;
+
+                // If we hit an "account not found" style error (common when querying too soon),
+                // retry once after a longer delay with a slightly longer timeout.
+                if let Ok(Err(ref e)) = sec_result {
+                    let err_str = e.to_string();
+                    if err_str.contains("account not found")
+                        || err_str.contains("null value")
+                    {
+                        tokio::time::sleep(std::time::Duration::from_millis(2000)).await;
+                        sec_result = tokio::time::timeout(
+                            std::time::Duration::from_millis(1000),
+                            crate::security::fetch_mint_security(url, &mint_for_security),
+                        )
+                        .await;
+                    }
+                }
+
+                match sec_result {
                     Ok(Ok(sec)) => {
                         launch_bg.security = Some(sec.clone());
                         let update = TokenSecurityUpdate {

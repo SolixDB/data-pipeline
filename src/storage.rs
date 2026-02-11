@@ -601,23 +601,6 @@ pub fn spawn_storage_worker(
                             (p, p * 1_000_000_000.0, s.real_sol_reserves as f64 / 1_000_000_000.0)
                         })
                         .unwrap_or((0.0, 0.0, 0.0));
-                    // #region agent log
-                    if market_cap > 1_000_000_000_000.0 || price > 1_000_000.0 {
-                        crate::handler::debug_log(
-                            "storage.rs:launch_price_snapshot",
-                            "suspicious_launch_price_snapshot",
-                            serde_json::json!({
-                                "mint": launch.mint.as_str().get(..16).unwrap_or(&launch.mint),
-                                "price": price,
-                                "market_cap": market_cap,
-                                "liquidity_sol": liquidity_sol,
-                                "v_sol": launch.initial_bonding_curve_state.as_ref().map(|s| s.virtual_sol_reserves),
-                                "v_tok": launch.initial_bonding_curve_state.as_ref().map(|s| s.virtual_token_reserves),
-                            }),
-                            "MCAP_H3",
-                        );
-                    }
-                    // #endregion
                     let payload = TokenLaunchPayload {
                         signature: launch.signature.clone(),
                         slot: launch.slot,
