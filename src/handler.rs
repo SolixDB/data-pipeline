@@ -463,56 +463,6 @@ async fn handle_transaction(
         let needs_rpc_metadata = launch_bg.symbol.is_empty() && launch_bg.uri.is_empty();
 
         tokio::spawn(async move {
-            if let Some(url) = rpc_url_bg.as_deref() {
-                let mint_for_security = launch_bg.mint.clone();
-
-                // Give the RPC node a moment to index the newly created mint account.
-                tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
-
-                let mut sec_result = tokio::time::timeout(
-                    std::time::Duration::from_millis(500),
-                    crate::security::fetch_mint_security(url, &mint_for_security),
-                )
-                .await;
-
-                // If we hit an "account not found" style error (common when querying too soon),
-                // retry once after a longer delay with a slightly longer timeout.
-                if let Ok(Err(ref e)) = sec_result {
-                    let err_str = e.to_string();
-                    if err_str.contains("account not found")
-                        || err_str.contains("null value")
-                    {
-                        tokio::time::sleep(std::time::Duration::from_millis(2000)).await;
-                        sec_result = tokio::time::timeout(
-                            std::time::Duration::from_millis(1000),
-                            crate::security::fetch_mint_security(url, &mint_for_security),
-                        )
-                        .await;
-                    }
-                }
-
-                match sec_result {
-                    Ok(Ok(sec)) => {
-                        launch_bg.security = Some(sec.clone());
-                        let update = TokenSecurityUpdate {
-                            mint: launch_bg.mint.clone(),
-                            security: sec,
-                        };
-                        if let Ok(bytes) =
-                            rmp_serde::to_vec_named(&ServerMessage::TokenSecurityUpdate(update))
-                        {
-                            ws_server_bg.broadcast(launch_bg.mint.clone(), bytes);
-                        }
-                    }
-                    Ok(Err(e)) => {
-                        debug!("Failed to fetch security for {}: {}", mint_for_security, e);
-                    }
-                    Err(_) => {
-                        debug!("Security fetch timeout for {}", mint_for_security);
-                    }
-                }
-            }
-
             // For PumpAMM direct CreatePool launches (no Pump.fun CreateEvent), best-effort fetch token metadata via RPC
             // and then rebroadcast + persist an updated token_launch.
             if needs_rpc_metadata {
