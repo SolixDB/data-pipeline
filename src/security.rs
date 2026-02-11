@@ -8,8 +8,6 @@ pub struct MintSecurity {
     pub mint_authority: Option<String>,
     pub freeze_authority: Option<String>,
     /// Total supply in **base units** (raw, same as SPL mint account).
-    /// For "top N hold %": use (sum of holder token balances in base units) / supply * 100, then clamp to 0..100.
-    /// Using supply/10^decimals as denominator while balances are in base units will produce >100%.
     pub supply: u64,
     pub decimals: u8,
     pub is_initialized: bool,

@@ -184,13 +184,7 @@ Payload:
 - `mint_authority_renounced` (bool)
 - `freeze_authority_renounced` (bool)
 
-**Supply and “top N hold %”:**
-- `security.supply` is in **base units** (raw token amount, same as the SPL mint account).
-- To show “top 10 hold X%”: get the top 10 token account balances in **base units**, then:
-  - `top10_pct = (sum_of_balances_base / security.supply) * 100`
-  - Clamp the result to `0`–`100`. If you see >100%, the cause is usually:
-    - Using **supply in human form** (supply / 10^decimals) as the denominator while balances are in base units, or
-    - Using the **inverted ratio** (supply / sum) instead of (sum / supply).
+**Note (top holders %):** The pipeline does **not** send `top10_pct` and does not expect the UI to compute it on every trade. If you want “top holders %”, compute it on-demand from a dedicated holder indexer/RPC call and cache it (detail page only), or omit it entirely.
 
 Semantics:
 

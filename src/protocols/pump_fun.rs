@@ -220,6 +220,17 @@ pub fn parse_create_from_tx_logs(
     use base64::Engine;
     let decoder = base64::engine::general_purpose::STANDARD;
     let signature_str = bs58::encode(signature).into_string();
+
+    // Hard filter: only treat a CreateEvent as a pump.fun launch when the tx logs clearly show pump.fun Create/CreateV2.
+    // This prevents false positives from other Anchor programs that might emit a similarly-shaped CreateEvent.
+    let has_create_marker = log_messages
+        .iter()
+        .any(|l| l.contains("Instruction: Create") || l.contains("Instruction: CreateV2"));
+    let mentions_pump_fun_program = log_messages.iter().any(|l| l.contains(PUMP_FUN_PROGRAM_ID));
+    if !has_create_marker || !mentions_pump_fun_program {
+        return None;
+    }
+
     for log in log_messages {
         let data_str = program_data_payload(log)?;
         let data = decoder.decode(data_str).ok()?;
