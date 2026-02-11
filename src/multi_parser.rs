@@ -38,18 +38,38 @@ pub fn parse_token_launches(
     let mut flat = Vec::new();
     flatten_instructions(instructions, &mut flat);
     let mut out = Vec::new();
-    for ix in flat {
+    let mut seen = HashSet::new();
+
+    // Primary: rigid log-based CreateV2 detection. Does not depend on Geyser giving us the Create instruction.
+    if let Some(pump_ix) = flat.iter().find(|ix| {
         let program_bytes: &[u8] = ix.program.as_ref();
-        if parser_map.get(program_bytes) == Some(&"pump_fun") {
-            if let Some(launch) = protocols::pump_fun::parse_create(ix, received_at) {
+        parser_map.get(program_bytes) == Some(&"pump_fun")
+    }) {
+        if let Some(launch) = protocols::pump_fun::parse_create_from_tx_logs(
+            &pump_ix.shared.log_messages,
+            &pump_ix.shared.signature,
+            pump_ix.shared.slot,
+            received_at,
+        ) {
+            if seen.insert((launch.signature.clone(), launch.mint.clone())) {
                 out.push(launch);
             }
         }
     }
-    let mut seen = HashSet::new();
-    out.into_iter()
-        .filter(|l| seen.insert((l.signature.clone(), l.mint.clone())))
-        .collect()
+
+    // Fallback: per-instruction parse (uses ix.data when Geyser provides it; enriches abc/g from accounts).
+    for ix in flat {
+        let program_bytes: &[u8] = ix.program.as_ref();
+        if parser_map.get(program_bytes) == Some(&"pump_fun") {
+            if let Some(launch) = protocols::pump_fun::parse_create(ix, received_at) {
+                if seen.insert((launch.signature.clone(), launch.mint.clone())) {
+                    out.push(launch);
+                }
+            }
+        }
+    }
+
+    out
 }
 
 pub fn parse_trade_events(

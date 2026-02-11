@@ -69,6 +69,7 @@ Behaviour:
     - `migration` for that mint
     - `token_security_update` for that mint
     - `ohclv` candles for that mint
+  - `topic = "tickers"` → periodic **snapshot_tickers** with **accurate volume** (recalculated from trade history with a delay; see “Volume and market cap” below).
 
 The server does not send acks for subscribe/unsubscribe; just start / stop getting those topics.
 
@@ -158,6 +159,12 @@ Key fields:
 - `is_bonding_curve`, `pool?`
 
 **Volume semantics:** All volume fields are in **SOL** (not lamports). They are rolling windows from **on-chain trade time** (5m, 1h, 6h, 24h). The pipeline deduplicates by transaction (same tx is never counted twice). Use `volume_sol` or `volume_24h` for “total volume” display; both are the 24h window.
+
+**Volume and market cap:**
+- **Market cap** is sent with the launch and with every trade **without awaiting** any slow work (security fetch, DB, Redis run in the background). So mcap appears as soon as we have it and matches Pump.fun.
+- **Volume** is computed **accurately** by recalculating from trade history (not incremental), with a configurable delay (default 10s via `VOLUME_DISPLAY_DELAY_SECS`) so the number aligns with terminal-style updates. You get volume in two ways:
+  1. **On each trade:** the `trade` message includes delayed volume fields (`volume_sol`, `volume_5m`, etc.) so the UI can update on every trade (value excludes the last N seconds).
+  2. **Periodic tickers:** subscribe to topic `"tickers"` to receive `snapshot_tickers` every N seconds with the same accurate delayed volume for all tokens. Prefer this for a single source of truth for volume if you want smooth, batched updates.
 
 Use this to:
 

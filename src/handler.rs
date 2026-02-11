@@ -2,7 +2,7 @@ use crate::config::Config;
 use crate::db;
 use crate::events::{TradeDirection, Migration};
 use crate::health::HealthState;
-use crate::messages::{ServerMessage, TokenLaunchPayload, TokenSecurityUpdate};
+use crate::messages::{ServerMessage, TokenLaunchPayload, TokenSecurityUpdate, TokenTicker};
 use crate::multi_parser;
 use crate::storage::{StorageMessage, SnapshotState, TokenState, MigratedEntry};
 use crate::ws_server::WsServer;
@@ -88,10 +88,23 @@ pub async fn handle_stream_updates(
     let mut reorder_buffer: std::collections::BTreeMap<(u64, u64), yellowstone_grpc_proto::geyser::SubscribeUpdateTransaction> = std::collections::BTreeMap::new();
     let max_buffer_size = 1000;
 
-    while let Some(message) = stream.next().await {
-        match message {
-            Ok(msg) => {
-                match msg.update_oneof {
+    let volume_delay_secs = crate::storage::volume_display_delay_secs();
+    let mut volume_interval = tokio::time::interval(std::time::Duration::from_secs(volume_delay_secs));
+    volume_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let _ = volume_interval.tick().await;
+
+    loop {
+        tokio::select! {
+            msg = stream.next() => {
+                let message = match msg {
+                    None => break,
+                    Some(Err(e)) => {
+                        error!("Stream error: {:?}", e);
+                        return Err(anyhow::anyhow!("Stream error: {}", e));
+                    }
+                    Some(Ok(m)) => m,
+                };
+                match message.update_oneof {
                     Some(UpdateOneof::Transaction(tx_update)) => {
                         let txn_slot = tx_update.slot;
                         let txn_index = tx_update
@@ -162,9 +175,32 @@ pub async fn handle_stream_updates(
                     last_ping = std::time::Instant::now();
                 }
             }
-            Err(e) => {
-                error!("Stream error: {:?}", e);
-                return Err(anyhow::anyhow!("Stream error: {}", e));
+            _ = volume_interval.tick() => {
+                if let Some(ref state_lock) = snapshot_state {
+                    let r = state_lock.read().await;
+                    let delay = crate::storage::volume_display_delay_secs();
+                    let tickers: Vec<TokenTicker> = r.tickers.values()
+                        .map(|t| {
+                            let vol = t.volume_metrics_delayed(delay);
+                            TokenTicker {
+                                mint: t.mint.clone(),
+                                price: t.price,
+                                market_cap: t.market_cap,
+                                liquidity_sol: t.liquidity_sol,
+                                volume_metrics: vol,
+                                total_fees_sol: t.total_fees_sol,
+                                last_slot: t.last_slot,
+                                migrated_to_pool: t.migrated_to_pool.clone(),
+                            }
+                        })
+                        .collect();
+                    drop(r);
+                    if !tickers.is_empty() {
+                        if let Ok(bytes) = rmp_serde::to_vec_named(&ServerMessage::SnapshotTickers(tickers)) {
+                            ws_server.broadcast("tickers".to_string(), bytes);
+                        }
+                    }
+                }
             }
         }
     }
@@ -267,6 +303,22 @@ async fn handle_transaction(
             .clone()
             .unwrap_or_default();
 
+        let (price, market_cap, liquidity_sol) = launch
+            .initial_bonding_curve_state
+            .map(|s| {
+                let v_sol = s.virtual_sol_reserves as f64;
+                let v_tok = s.virtual_token_reserves as f64;
+                let price = if v_tok > 0.0 {
+                    (v_sol / v_tok) / 1000.0
+                } else {
+                    0.0
+                };
+                let market_cap = price * 1_000_000_000.0;
+                let liquidity_sol = s.real_sol_reserves as f64 / 1_000_000_000.0;
+                (price, market_cap, liquidity_sol)
+            })
+            .unwrap_or((0.0, 0.0, 0.0));
+
         let payload = TokenLaunchPayload {
             signature: launch.signature.clone(),
             slot: launch.slot,
@@ -280,8 +332,13 @@ async fn handle_transaction(
             initial_bonding_curve_state: launch.initial_bonding_curve_state,
             pump_constants: launch.pump_constants.clone(),
             security: launch.security.clone(),
+            price,
+            market_cap,
+            liquidity_sol,
         };
 
+        // Send launch (and mcap/price/liquidity) immediately without awaiting; accurate and fast.
+        // Security fetch, storage, Redis run in a background task so they never block mcap.
         if let Ok(bytes) = rmp_serde::to_vec_named(&ServerMessage::TokenLaunch(payload)) {
             ws_server.broadcast("launches".to_string(), bytes);
         }
@@ -438,19 +495,20 @@ async fn handle_transaction(
             let fee_sol = trade.fee as f64 / 1_000_000_000.0;
             token_state.total_fees_sol += fee_sol;
 
-            trade.volume_sol = token_state.volume_metrics.volume_24h;
-            trade.volume_5m = token_state.volume_metrics.volume_5m;
-            trade.volume_1h = token_state.volume_metrics.volume_1h;
-            trade.volume_6h = token_state.volume_metrics.volume_6h;
-            
-            trade.tx_count = token_state.volume_metrics.tx_count_24h;
-            trade.tx_count_5m = token_state.volume_metrics.tx_count_5m;
-            trade.tx_count_1h = token_state.volume_metrics.tx_count_1h;
-            trade.tx_count_6h = token_state.volume_metrics.tx_count_6h;
-            trade.price_change_5m = token_state.volume_metrics.price_change_5m;
-            trade.price_change_1h = token_state.volume_metrics.price_change_1h;
-            trade.price_change_6h = token_state.volume_metrics.price_change_6h;
-            trade.price_change_24h = token_state.volume_metrics.price_change_24h;
+            let delayed = token_state.volume_metrics_delayed(crate::storage::volume_display_delay_secs());
+            trade.volume_sol = delayed.volume_24h;
+            trade.volume_5m = delayed.volume_5m;
+            trade.volume_1h = delayed.volume_1h;
+            trade.volume_6h = delayed.volume_6h;
+
+            trade.tx_count = delayed.tx_count_24h;
+            trade.tx_count_5m = delayed.tx_count_5m;
+            trade.tx_count_1h = delayed.tx_count_1h;
+            trade.tx_count_6h = delayed.tx_count_6h;
+            trade.price_change_5m = delayed.price_change_5m;
+            trade.price_change_1h = delayed.price_change_1h;
+            trade.price_change_6h = delayed.price_change_6h;
+            trade.price_change_24h = delayed.price_change_24h;
 
             trade.total_fees_sol = token_state.total_fees_sol;
 

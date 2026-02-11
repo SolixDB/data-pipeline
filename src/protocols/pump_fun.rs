@@ -14,6 +14,8 @@ pub const PUMP_FUN_FEE_PROGRAM_ID: &str = "pfeeUxB6jkeY1Hxd7CsFCAjcbHA9rWtchMGdZ
 const CREATE_DISCRIMINATOR: [u8; 8] = [0x18, 0x1e, 0xc8, 0x28, 0x05, 0x1c, 0x07, 0x77];
 /// CreateV2 instruction discriminator (IDL createV2).
 const CREATE_V2_DISCRIMINATOR: [u8; 8] = [0xd6, 0x90, 0x4c, 0xec, 0x5f, 0x8b, 0x31, 0xb4];
+/// Anchor event discriminator for CreateEvent: first 8 bytes of sha256("event:CreateEvent").
+const CREATE_EVENT_DISCRIMINATOR: [u8; 8] = [27, 114, 169, 77, 222, 235, 99, 118];
 
 fn is_create_instruction(ix: &InstructionUpdate) -> bool {
     ix.data.len() >= 8
@@ -52,7 +54,10 @@ fn txn_timestamp_from_create_logs(ix: &InstructionUpdate) -> Option<u64> {
     use base64::Engine;
     let decoder = base64::engine::general_purpose::STANDARD;
     for log in &ix.shared.log_messages {
-        let data_str = log.strip_prefix("Program data: ")?;
+        let data_str = log
+            .trim()
+            .strip_prefix("Program data: ")
+            .or_else(|| log.trim().strip_prefix("> Program data: "))?;
         let data = decoder.decode(data_str.trim()).ok()?;
         if data.len() < TRADE_EVENT_MIN_SIZE {
             continue;
@@ -83,9 +88,45 @@ fn read_length_prefixed_string(data: &[u8], offset: &mut usize) -> Option<String
     Some(s)
 }
 
-/// Parse createEvent from "Program data:" log (IDL: name, symbol, uri, mint, bondingCurve, user, creator, timestamp, ...).
-/// Used as fallback for CreateV2 when instruction data is missing or wrong.
-fn try_parse_create_event_from_logs(ix: &InstructionUpdate) -> Option<(String, String, String, String, String, String)> {
+/// Minimum size for createEvent: discriminator(8) + at least 3 length-prefixed strings + 4*32 + 8.
+const CREATE_EVENT_MIN_LEN: usize = 8 + 4 * 3 + 32 * 4 + 8;
+
+/// Valid timestamp range (roughly 2020–2050).
+const TIMESTAMP_MIN: u64 = 1577836800;
+const TIMESTAMP_MAX: u64 = 2524608000;
+
+/// Parse createEvent from raw bytes. Requires exact CreateEvent discriminator so we never
+/// mistake trade/migrate/extend events for create. Layout: discriminator(8), name, symbol, uri,
+/// mint(32), bonding_curve(32), user(32), creator(32), timestamp(8).
+/// Returns (name, symbol, uri, mint, bonding_curve, creator, timestamp_millis).
+fn decode_create_event(data: &[u8]) -> Option<(String, String, String, String, String, String, u64)> {
+    if data.len() < CREATE_EVENT_MIN_LEN || data[0..8] != CREATE_EVENT_DISCRIMINATOR {
+        return None;
+    }
+    let mut offset = 8;
+    let name = read_length_prefixed_string(data, &mut offset)?;
+    let symbol = read_length_prefixed_string(data, &mut offset)?;
+    let uri = read_length_prefixed_string(data, &mut offset)?;
+    if offset + 32 * 4 + 8 > data.len() {
+        return None;
+    }
+    let mint = bs58::encode(&data[offset..offset + 32]).into_string();
+    let bonding_curve = bs58::encode(&data[offset + 32..offset + 64]).into_string();
+    let _user = bs58::encode(&data[offset + 64..offset + 96]).into_string();
+    let creator = bs58::encode(&data[offset + 96..offset + 128]).into_string();
+    let timestamp_sec = i64::from_le_bytes(data[offset + 128..offset + 136].try_into().ok()?);
+    if !(TIMESTAMP_MIN..=TIMESTAMP_MAX).contains(&(timestamp_sec as u64)) {
+        return None;
+    }
+    if mint.is_empty() || bonding_curve.is_empty() || creator.is_empty() {
+        return None;
+    }
+    Some((name, symbol, uri, mint, bonding_curve, creator, timestamp_sec as u64 * 1000))
+}
+
+/// Parse createEvent from "Program data:" log (same layout as decode_create_event).
+/// Used when we have an InstructionUpdate (per-instruction fallback).
+fn try_parse_create_event_from_logs(ix: &InstructionUpdate) -> Option<(String, String, String, String, String, String, u64)> {
     use base64::Engine;
     let decoder = base64::engine::general_purpose::STANDARD;
     for log in &ix.shared.log_messages {
@@ -94,84 +135,200 @@ fn try_parse_create_event_from_logs(ix: &InstructionUpdate) -> Option<(String, S
             .strip_prefix("Program data: ")
             .or_else(|| log.trim().strip_prefix("> Program data: "))?;
         let data = decoder.decode(data_str.trim()).ok()?;
-        if data.len() < 8 + 4 * 3 + 32 * 4 + 8 {
-            continue;
+        if let Some(t) = decode_create_event(&data) {
+            return Some(t);
         }
-        let mut offset = 8;
-        let name = read_length_prefixed_string(&data, &mut offset)?;
-        let symbol = read_length_prefixed_string(&data, &mut offset)?;
-        let uri = read_length_prefixed_string(&data, &mut offset)?;
-        if offset + 32 * 4 + 8 > data.len() {
-            continue;
-        }
-        let mint = bs58::encode(&data[offset..offset + 32]).into_string();
-        let bonding_curve = bs58::encode(&data[offset + 32..offset + 64]).into_string();
-        let _user = bs58::encode(&data[offset + 64..offset + 96]).into_string();
-        let creator = bs58::encode(&data[offset + 96..offset + 128]).into_string();
-        let timestamp_sec = i64::from_le_bytes(data[offset + 128..offset + 136].try_into().ok()?);
-        if !(1577836800..=2524608000).contains(&(timestamp_sec as u64)) {
-            continue;
-        }
-        if mint.is_empty() || bonding_curve.is_empty() {
-            continue;
-        }
-        return Some((name, symbol, uri, mint, bonding_curve, creator));
     }
     None
 }
 
-pub fn parse_create(ix: &InstructionUpdate, received_at: u64) -> Option<crate::events::TokenLaunch> {
-    if !has_create_in_logs(ix) || !is_create_instruction(ix) {
-        return None;
+/// Rigid, log-only CreateV2 launch detection. Does not depend on Geyser giving us the Create
+/// instruction or its data. Scans transaction logs for the first "Program data:" that decodes
+/// to a valid CreateEvent (discriminator + layout). Use this as the primary source for launches.
+pub fn parse_create_from_tx_logs(
+    log_messages: &[String],
+    signature: &[u8],
+    slot: u64,
+    received_at: u64,
+) -> Option<crate::events::TokenLaunch> {
+    use base64::Engine;
+    let decoder = base64::engine::general_purpose::STANDARD;
+    let signature_str = bs58::encode(signature).into_string();
+    for log in log_messages {
+        let data_str = log
+            .trim()
+            .strip_prefix("Program data: ")
+            .or_else(|| log.trim().strip_prefix("> Program data: "))?;
+        let data = decoder.decode(data_str.trim()).ok()?;
+        if let Some((name, symbol, uri, mint, bonding_curve, creator, txn_timestamp)) = decode_create_event(&data) {
+            if let Some(mut launch) = build_token_launch_from_event(
+                &signature_str,
+                slot,
+                received_at,
+                true,
+                name,
+                symbol,
+                uri,
+                mint,
+                creator,
+                bonding_curve,
+            ) {
+                launch.txn_timestamp = txn_timestamp;
+                return Some(launch);
+            }
+        }
     }
+    None
+}
 
-    let is_token_2022 = ix.data.len() >= 8 && ix.data[0..8] == CREATE_V2_DISCRIMINATOR;
+/// Build TokenLaunch from createEvent fields only (no instruction accounts). Used by
+/// parse_create_from_tx_logs so we never depend on Geyser instruction data.
+fn build_token_launch_from_event(
+    signature: &str,
+    slot: u64,
+    received_at: u64,
+    is_token_2022: bool,
+    name: String,
+    symbol: String,
+    uri: String,
+    mint: String,
+    creator: String,
+    bonding_curve: String,
+) -> Option<crate::events::TokenLaunch> {
+    let metadata_program_id = Pubkey::from_str("metaqbxxUerdq28cj1RbAWkYQm3ybzjb6a8bt518x1s").unwrap_or_default();
+    let mint_pubkey = Pubkey::from_str(&mint).unwrap_or_default();
+    let (metadata_pda, _) = Pubkey::find_program_address(
+        &[b"metadata", metadata_program_id.as_ref(), mint_pubkey.as_ref()],
+        &metadata_program_id,
+    );
+    let metadata = Some(metadata_pda.to_string());
+
+    let pump_program = Pubkey::from_str(PUMP_FUN_PROGRAM_ID).unwrap_or_default();
+    let fee_program = Pubkey::from_str(PUMP_FUN_FEE_PROGRAM_ID).unwrap_or_default();
+    let creator_bytes = bs58::decode(&creator).into_vec().ok();
+    let creator_slice: &[u8] = match creator_bytes.as_deref() {
+        Some(b) if b.len() >= 32 => &b[..32],
+        _ => return None,
+    };
+    let (creator_vault_pda, _) = Pubkey::find_program_address(
+        &[b"creator-vault", creator_slice],
+        &pump_program,
+    );
+    let (fee_config_pda, _) = Pubkey::find_program_address(
+        &[b"fee_config", pump_program.as_ref()],
+        &fee_program,
+    );
+    let (event_authority_pda, _) = Pubkey::find_program_address(&[b"__event_authority"], &pump_program);
+
+    let pump_accounts = crate::events::PumpFunBondingCurveAccounts {
+        bonding_curve: Some(bonding_curve),
+        associated_bonding_curve: None,
+        global: None,
+        fee_recipient: Some(PUMP_FUN_FEE_RECIPIENT.to_string()),
+        metadata,
+        creator_vault: Some(creator_vault_pda.to_string()),
+        fee_config: Some(fee_config_pda.to_string()),
+        event_authority: Some(event_authority_pda.to_string()),
+    };
+
+    Some(crate::events::TokenLaunch {
+        signature: signature.to_string(),
+        slot,
+        mint,
+        name,
+        symbol,
+        uri,
+        creator,
+        pump_accounts,
+        token_decimals: 6,
+        initial_bonding_curve_state: None,
+        pump_constants: crate::events::PumpProtocolConstants::default(),
+        security: None,
+        is_token_2022,
+        txn_timestamp: received_at / 1000,
+        received_at,
+        sent_at: 0,
+    })
+}
+
+pub fn parse_create(ix: &InstructionUpdate, received_at: u64) -> Option<crate::events::TokenLaunch> {
     let signature = bs58::encode(ix.shared.signature.as_slice()).into_string();
     let txn_timestamp = txn_timestamp_from_create_logs(ix).unwrap_or(received_at / 1000);
 
-    let data = &ix.data;
-    if data.len() >= 8 {
-        let mut offset = 8;
-        if let (Some(n), Some(s), Some(u)) = (
-            read_length_prefixed_string(data, &mut offset),
-            read_length_prefixed_string(data, &mut offset),
-            read_length_prefixed_string(data, &mut offset),
-        ) {
-            if offset + 32 <= data.len() {
-                let c = bs58::encode(&data[offset..offset + 32]).into_string();
-                let m = ix.accounts.get(0).map(|p| bs58::encode(&p.0).into_string()).unwrap_or_default();
-                let bc = ix.accounts.get(2).map(|p| bs58::encode(&p.0).into_string());
+    // Path 1: current instruction is Create/CreateV2 (discriminator in ix.data)
+    if has_create_in_logs(ix) && is_create_instruction(ix) {
+        let is_token_2022 = ix.data.len() >= 8 && ix.data[0..8] == CREATE_V2_DISCRIMINATOR;
+
+        let data = &ix.data;
+        if data.len() >= 8 {
+            let mut offset = 8;
+            if let (Some(n), Some(s), Some(u)) = (
+                read_length_prefixed_string(data, &mut offset),
+                read_length_prefixed_string(data, &mut offset),
+                read_length_prefixed_string(data, &mut offset),
+            ) {
+                if offset + 32 <= data.len() {
+                    let c = bs58::encode(&data[offset..offset + 32]).into_string();
+                    let m = ix.accounts.get(0).map(|p| bs58::encode(&p.0).into_string()).unwrap_or_default();
+                    let bc = ix.accounts.get(2).map(|p| bs58::encode(&p.0).into_string());
+                    let abc = ix.accounts.get(3).map(|p| bs58::encode(&p.0).into_string());
+                    let g = ix.accounts.get(4).map(|p| bs58::encode(&p.0).into_string());
+                    if !m.is_empty() || !n.is_empty() || !s.is_empty() || !u.is_empty() {
+                        if let Some(launch) = build_token_launch(
+                            ix,
+                            &signature,
+                            txn_timestamp,
+                            received_at,
+                            is_token_2022,
+                            n,
+                            s,
+                            u,
+                            m,
+                            c,
+                            bc,
+                            abc,
+                            g,
+                        ) {
+                            return Some(launch);
+                        }
+                    }
+                }
+            }
+        }
+
+        if is_token_2022 {
+            if let Some((n, s, u, m, bc, c, txn_ts)) = try_parse_create_event_from_logs(ix) {
                 let abc = ix.accounts.get(3).map(|p| bs58::encode(&p.0).into_string());
                 let g = ix.accounts.get(4).map(|p| bs58::encode(&p.0).into_string());
-                if !m.is_empty() || !n.is_empty() || !s.is_empty() || !u.is_empty() {
-                    return build_token_launch(
-                        ix,
-                        &signature,
-                        txn_timestamp,
-                        received_at,
-                        is_token_2022,
-                        n,
-                        s,
-                        u,
-                        m,
-                        c,
-                        bc,
-                        abc,
-                        g,
-                    );
+                if let Some(launch) = build_token_launch(
+                    ix,
+                    &signature,
+                    txn_ts,
+                    received_at,
+                    true,
+                    n,
+                    s,
+                    u,
+                    m,
+                    c,
+                    Some(bc),
+                    abc,
+                    g,
+                ) {
+                    return Some(launch);
                 }
             }
         }
     }
 
-    if is_token_2022 {
-        if let Some((n, s, u, m, bc, c)) = try_parse_create_event_from_logs(ix) {
-            let abc = ix.accounts.get(3).map(|p| bs58::encode(&p.0).into_string());
-            let g = ix.accounts.get(4).map(|p| bs58::encode(&p.0).into_string());
-            return build_token_launch(
+    // Path 2: CreateV2 in logs but current instruction is not Create (e.g. Buy in same tx).
+    // Geyser may not give us CreateV2 ix.data; parse launch from createEvent in logs.
+    if has_create_v2_in_logs(ix) {
+        if let Some((n, s, u, m, bc, c, txn_ts)) = try_parse_create_event_from_logs(ix) {
+            if let Some(launch) = build_token_launch(
                 ix,
                 &signature,
-                txn_timestamp,
+                txn_ts,
                 received_at,
                 true,
                 n,
@@ -180,9 +337,11 @@ pub fn parse_create(ix: &InstructionUpdate, received_at: u64) -> Option<crate::e
                 m,
                 c,
                 Some(bc),
-                abc,
-                g,
-            );
+                None,
+                None,
+            ) {
+                return Some(launch);
+            }
         }
     }
 

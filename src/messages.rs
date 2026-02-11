@@ -18,6 +18,12 @@ pub struct TokenLaunchPayload {
     pub pump_constants: crate::events::PumpProtocolConstants,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub security: Option<crate::security::MintSecurity>,
+    #[serde(default)]
+    pub price: f64,
+    #[serde(default)]
+    pub market_cap: f64,
+    #[serde(default)]
+    pub liquidity_sol: f64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

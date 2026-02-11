@@ -311,6 +311,55 @@ impl TokenState {
         self.cleanup_and_recalculate(current_time_micros);
         self.last_cleanup_micros = current_time_micros;
     }
+
+    /// Volume metrics excluding trades from the last `delay_secs` seconds. Use for display so
+    /// frontend aligns with terminals that update volume with a delay (avoids instant spikes).
+    pub fn volume_metrics_delayed(&self, delay_secs: u64) -> VolumeMetrics {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_micros() as u64;
+        let cutoff = now.saturating_sub(delay_secs * 1_000_000);
+        const WINDOW_5M: u64 = 5 * 60 * 1_000_000;
+        const WINDOW_1H: u64 = 60 * 60 * 1_000_000;
+        const WINDOW_6H: u64 = 6 * 60 * 60 * 1_000_000;
+        const WINDOW_24H: u64 = 24 * 60 * 60 * 1_000_000;
+        let mut m = VolumeMetrics::default();
+        for t in &self.trade_history {
+            if t.timestamp_micros > cutoff {
+                continue;
+            }
+            let age = now.saturating_sub(t.timestamp_micros);
+            if age <= WINDOW_5M {
+                m.volume_5m += t.sol_amount;
+                m.tx_count_5m += 1;
+            }
+            if age <= WINDOW_1H {
+                m.volume_1h += t.sol_amount;
+                m.tx_count_1h += 1;
+            }
+            if age <= WINDOW_6H {
+                m.volume_6h += t.sol_amount;
+                m.tx_count_6h += 1;
+            }
+            if age <= WINDOW_24H {
+                m.volume_24h += t.sol_amount;
+                m.tx_count_24h += 1;
+            }
+        }
+        m.price_change_5m = self.volume_metrics.price_change_5m;
+        m.price_change_1h = self.volume_metrics.price_change_1h;
+        m.price_change_6h = self.volume_metrics.price_change_6h;
+        m.price_change_24h = self.volume_metrics.price_change_24h;
+        m
+    }
+}
+
+pub fn volume_display_delay_secs() -> u64 {
+    std::env::var("VOLUME_DISPLAY_DELAY_SECS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(10)
 }
 
 pub const REDIS_KEY_MIGRATED: &str = "snapshot:migrated";
@@ -528,6 +577,15 @@ pub fn spawn_storage_worker(
         while let Some(msg) = rx.recv().await {
             match msg {
                 StorageMessage::TokenLaunch(launch) => {
+                    let (price, market_cap, liquidity_sol) = launch
+                        .initial_bonding_curve_state
+                        .map(|s| {
+                            let v_sol = s.virtual_sol_reserves as f64;
+                            let v_tok = s.virtual_token_reserves as f64;
+                            let p = if v_tok > 0.0 { (v_sol / v_tok) / 1000.0 } else { 0.0 };
+                            (p, p * 1_000_000_000.0, s.real_sol_reserves as f64 / 1_000_000_000.0)
+                        })
+                        .unwrap_or((0.0, 0.0, 0.0));
                     let payload = TokenLaunchPayload {
                         signature: launch.signature.clone(),
                         slot: launch.slot,
@@ -541,6 +599,9 @@ pub fn spawn_storage_worker(
                         initial_bonding_curve_state: launch.initial_bonding_curve_state,
                         pump_constants: launch.pump_constants.clone(),
                         security: launch.security.clone(),
+                        price,
+                        market_cap,
+                        liquidity_sol,
                     };
 
                     last_launches.push_front(payload);
