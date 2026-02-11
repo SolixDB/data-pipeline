@@ -381,6 +381,8 @@ pub struct SnapshotState {
     pub last_processed_tx_index: u64,
     /// Recent (mint, creator, received_at_micros) for dev-buy lookup; pruned when older than RECENT_LAUNCHES_WINDOW_MICROS.
     pub recent_launches: VecDeque<(String, String, u64)>,
+    /// Last sent launch payload per mint (used to re-send launch with updated price/mcap/liquidity on migration).
+    pub latest_launch_by_mint: HashMap<String, TokenLaunchPayload>,
 }
 
 async fn flush_with_retry<F, Fut>(mut f: F)

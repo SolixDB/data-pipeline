@@ -75,6 +75,18 @@ The server does not send acks for subscribe/unsubscribe; just start / stop getti
 
 ---
 
+## Token details: single source of truth
+
+**Every pump.fun launch includes a CreateEvent in logs**, so the pipeline only sends a `token_launch` when it has token details (name, symbol, uri). If you see a mint with no name/symbol/uri, the cause is on the frontend: you must treat **`token_launch` and `snapshot_launches` as the only source of truth for token metadata** and merge by mint.
+
+- **Token metadata** (name, symbol, uri, creator, user, PDAs, curve state, etc.) comes **only** from:
+  - Live `token_launch` messages (topic `"launches"`), and
+  - `snapshot_launches` on connect.
+- **Trades, migrations, tickers** carry `mint`, price, volume, etc., but **do not** carry name/symbol/uri. Do not create or show a “token row” from a trade/migration/ticker alone without merging in launch data.
+- **Rule:** For any mint you display, maintain a **launch cache keyed by mint**. When you receive `token_launch` or an item from `snapshot_launches`, **upsert by mint** (create or replace). When you receive `trade`, `migration`, or `snapshot_tickers`, **update price/volume/state for that mint** but **never overwrite or ignore the launch payload** for that mint. If you don’t have launch data for a mint yet, show a placeholder (e.g. “Loading…” or mint shorthand) until a `token_launch` or `snapshot_launches` provides it.
+
+---
+
 ## Message types (what to render)
 
 ### 1. `connected`
@@ -106,9 +118,30 @@ Use only for logging / debugging.
 - Use `snapshot_tickers` to populate the main list (no blank screen).
 - Use `snapshot_launches` / `snapshot_trades` to backfill feeds.
 
+### Frontend implementation: token details and list state (replace existing logic)
+
+Follow these steps so mints never appear without token details.
+
+1. **State**
+   - Keep a **launch cache**: `Map<mint, TokenLaunchPayload>` (or equivalent). This is the source of truth for `name`, `symbol`, `uri`, `creator`, `user`, `pump_accounts`, `initial_bonding_curve_state`, etc.
+   - Keep separate structures for live price/volume/state (e.g. from trades and tickers) keyed by mint.
+
+2. **On connect (snapshots)**
+   - When you receive **`snapshot_launches`**, for each item in the array: **set `launchCache[item.mint] = item`** (replace if already present). Do not skip; do not merge only “new” fields.
+   - When you receive **`snapshot_trades`** or **`snapshot_tickers`**, update your trade/ticker state by mint. For the UI, **for each mint you display**, resolve display name/symbol/uri from **`launchCache.get(mint)`**. If missing, show a placeholder (e.g. mint slice or “Loading…”) until a launch for that mint appears.
+
+3. **Live `token_launch`**
+   - On every **`token_launch`** message: **set `launchCache[data.mint] = data`** (full replace). Then update the list/card for that mint so the row shows `data.name`, `data.symbol`, `data.uri`, etc. This applies to both the initial launch and the re-sent launch before a migration (which may only update price/mcap/liquidity; keep existing name/symbol/uri if you merge, or prefer the cached launch payload as above).
+
+4. **Live `trade` / `migration` / `ohclv`**
+   - Update price, volume, and migration state by mint. **Do not** create a new list entry from a trade or migration alone. If you add a row for a new mint when you see a trade/migration, that row must show token details from **`launchCache.get(mint)`**; if the cache has no entry, show a placeholder until a `token_launch` (or a later `snapshot_launches`) fills it.
+
+5. **Display rule**
+   - For any “new tokens” or “launches” list: **only show mints that exist in `launchCache`**, or if you show mints from tickers/trades first, **render name/symbol/uri from `launchCache`** and never from trade/ticker (they don’t carry it). Replacing existing logic with this flow ensures you never show a mint with empty token details when the pipeline has already sent a launch for it.
+
 ### 3. `token_launch`
 
-Payload (`TokenLaunchPayload`). Same shape is used for **live** `token_launch` and for **snapshot_launches** on connect.
+Payload (`TokenLaunchPayload`). Same shape is used for **live** `token_launch` and for **snapshot_launches** on connect. **The pipeline only sends a launch when it has token details (name/symbol/uri from CreateEvent).** Use this payload as the single source of truth for token metadata (see “Token details: single source of truth” and “Frontend implementation” above).
 
 - **Identity:** `signature`, `slot`, `mint`
 - **Display:** `name`, `symbol`, `uri`, `creator`
@@ -192,14 +225,25 @@ Use this to:
 
 ### 6. `migration`
 
+**Order of messages:** For each migration the pipeline sends a **`token_launch`** update first (same shape as §3), with current `price`, `market_cap`, and `liquidity_sol` for that mint, then sends the **`migration`** message. Use the launch update so the token card shows correct price/mcap/liquidity and “migrated” state before you apply the migration.
+
 Key fields:
 
 - `mint`, `user`
 - `bonding_curve`, `pool`
+- `token_amount`, `sol_amount`, `fee`, `txn_timestamp`
+- `bonding_curve_state?`: final bonding curve state at migration (curve drained). When present:
+  - `virtual_sol_reserves`, `virtual_token_reserves` are 0
+  - `real_sol_reserves`, `real_token_reserves` are from the event (e.g. SOL migrated). Use to show “100% complete” or progress.
+- **From pump_amm createPoolEvent** (when migration is from CreatePool logs), optional:
+  - `quote_mint?` (e.g. WSOL), `lp_mint?`, `coin_creator?`
+  - `is_mayhem_mode?` (bool)
+  - `pool_base_amount?`, `pool_quote_amount?`, `initial_liquidity?` (pool state at creation)
 
 Use this to:
 
 - Flip routing from bonding curve → AMM for a mint (`pool` is the AMM address).
+- Show “migrated” and avoid showing “bonding curve 100%” by handling the preceding `token_launch` update and then applying the `migration` event.
 
 ### 7. `ohclv`
 

@@ -180,6 +180,24 @@ pub struct Migration {
     pub txn_timestamp: u64,
     pub received_at: u64,
     pub sent_at: u64,
+    /// Final bonding curve state at migration (curve drained: virtual_* = 0, real_* from event amounts). Lets frontend show 100% complete.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bonding_curve_state: Option<BondingCurveState>,
+    /// From pump_amm createPoolEvent when present: quote mint (e.g. WSOL), lp_mint, coin creator, mayhem flag, pool amounts.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub quote_mint: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lp_mint: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub coin_creator: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub is_mayhem_mode: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pool_base_amount: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pool_quote_amount: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub initial_liquidity: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

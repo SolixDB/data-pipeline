@@ -352,12 +352,14 @@ async fn handle_transaction(
             debug!("Skipping launch with empty mint");
             continue;
         }
+        // CreateEvent is present on every pump.fun launch and carries name/symbol/uri. Do not send a launch with no token details.
         let has_display_data = !launch.name.is_empty() || !launch.symbol.is_empty() || !launch.uri.is_empty();
         if !has_display_data {
             debug!(
-                "Launch with no name/symbol/uri (sending anyway): mint={}",
+                "Skipping launch with no name/symbol/uri (CreateEvent missing or decode failed): mint={}",
                 &launch.mint
             );
+            continue;
         }
 
         // Add to known_mints immediately so trades in this tx (e.g. dev buy) are not skipped.
@@ -420,19 +422,22 @@ async fn handle_transaction(
             is_mayhem_mode: launch.is_mayhem_mode,
         };
 
-        // Send launch to frontend first; then update snapshot (recent_launches) so snapshot never has stale or partial data.
-        if let Ok(bytes) = rmp_serde::to_vec_named(&ServerMessage::TokenLaunch(payload)) {
+        // Send launch to frontend first; then update snapshot (recent_launches, latest_launch_by_mint) so snapshot never has stale or partial data.
+        if let Ok(bytes) = rmp_serde::to_vec_named(&ServerMessage::TokenLaunch(payload.clone())) {
             ws_server.broadcast("launches".to_string(), bytes);
         }
         debug!("{} | clients={}", log_msg, ws_server.client_count());
 
         if let Some(ref state_lock) = snapshot_state {
             let mut w = state_lock.write().await;
+            w.latest_launch_by_mint.insert(launch.mint.clone(), payload);
             w.recent_launches.push_back((launch.mint.clone(), launch.creator.clone(), received_at));
             let cutoff = received_at.saturating_sub(crate::storage::RECENT_LAUNCHES_WINDOW_MICROS);
             while w.recent_launches.front().map(|(_, _, ts)| *ts < cutoff).unwrap_or(false) {
                 w.recent_launches.pop_front();
             }
+            let kept_mints: HashSet<_> = w.recent_launches.iter().map(|(m, _, _)| m.clone()).collect();
+            w.latest_launch_by_mint.retain(|m, _| kept_mints.contains(m));
         }
 
         let metrics_client_bg = metrics_client.clone();
@@ -619,6 +624,12 @@ async fn handle_transaction(
                              slot: trade.slot,
                          });
 
+                         let bonding_curve_state = Some(crate::events::BondingCurveState {
+                             virtual_sol_reserves: 0,
+                             virtual_token_reserves: 0,
+                             real_sol_reserves: trade.real_sol_reserves,
+                             real_token_reserves: 0,
+                         });
                          migration_event = Some(Migration {
                              signature: trade.signature.clone(),
                              slot: trade.slot,
@@ -632,6 +643,14 @@ async fn handle_transaction(
                              txn_timestamp: trade.txn_timestamp,
                              received_at,
                              sent_at: unix_timestamp_micros(),
+                             bonding_curve_state,
+                             quote_mint: None,
+                             lp_mint: None,
+                             coin_creator: None,
+                             is_mayhem_mode: None,
+                             pool_base_amount: None,
+                             pool_quote_amount: None,
+                             initial_liquidity: None,
                          });
                      }
                  }
@@ -657,7 +676,30 @@ async fn handle_transaction(
                      }
                 }
             }
-            
+
+            // Send launch to frontend first (with current price/mcap/liquidity) so UI shows correct state before Migration.
+            if let Some(ref state_lock) = snapshot_state {
+                let mut launch_payload_opt = None;
+                {
+                    let w = state_lock.read().await;
+                    if let Some(payload) = w.latest_launch_by_mint.get(&m.mint).cloned() {
+                        let ts = w.tickers.get(&m.mint);
+                        launch_payload_opt = ts.map(|t| {
+                            let mut p = payload;
+                            p.price = t.price;
+                            p.market_cap = t.market_cap;
+                            p.liquidity_sol = t.liquidity_sol;
+                            p
+                        });
+                    }
+                }
+                if let Some(payload) = launch_payload_opt {
+                    if let Ok(bytes) = rmp_serde::to_vec_named(&ServerMessage::TokenLaunch(payload)) {
+                        ws_server.broadcast("launches".to_string(), bytes);
+                    }
+                }
+            }
+
             let count = migration_count.fetch_add(1, Ordering::Relaxed) + 1;
             let log_msg = format!(
                 "#{} MIGRATE (inferred) | mint={} -> pool={}",
@@ -665,7 +707,6 @@ async fn handle_transaction(
                 &m.mint[..m.mint.len().min(8)],
                 &m.pool[..m.pool.len().min(8)]
             );
-            
              if let Ok(bytes) = rmp_serde::to_vec_named(&ServerMessage::Migration(m.clone())) {
                 ws_server.broadcast(m.mint.clone(), bytes);
             }
@@ -719,10 +760,30 @@ async fn handle_transaction(
             continue;
         }
         if let Some(state_lock) = snapshot_state {
-            let mut w = state_lock.write().await;
-            let token_state = w.tickers.entry(migration.mint.clone())
-                .or_insert_with(|| TokenState::new(migration.mint.clone()));
-            token_state.migrated_to_pool = Some(migration.pool.clone());
+            let mut launch_payload_opt = None;
+            {
+                let mut w = state_lock.write().await;
+                let payload = w.latest_launch_by_mint.get(&migration.mint).cloned();
+                let (price, market_cap, liquidity_sol) = w.tickers
+                    .get(&migration.mint)
+                    .map(|t| (t.price, t.market_cap, t.liquidity_sol))
+                    .unwrap_or((0.0, 0.0, 0.0));
+                if let Some(mut p) = payload {
+                    p.price = price;
+                    p.market_cap = market_cap;
+                    p.liquidity_sol = liquidity_sol;
+                    launch_payload_opt = Some(p);
+                }
+                w.tickers
+                    .entry(migration.mint.clone())
+                    .or_insert_with(|| TokenState::new(migration.mint.clone()))
+                    .migrated_to_pool = Some(migration.pool.clone());
+            }
+            if let Some(payload) = launch_payload_opt {
+                if let Ok(bytes) = rmp_serde::to_vec_named(&ServerMessage::TokenLaunch(payload)) {
+                    ws_server.broadcast("launches".to_string(), bytes);
+                }
+            }
         }
 
         let count = migration_count.fetch_add(1, Ordering::Relaxed) + 1;

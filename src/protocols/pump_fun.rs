@@ -807,6 +807,14 @@ fn decode_migration_event(
 
     let pool = bs58::encode(&data[offset..offset + 32]).into_string();
 
+    // completePumpAmmMigrationEvent has no reserve fields; at migration curve is drained. Derive final state for frontend.
+    let bonding_curve_state = Some(crate::events::BondingCurveState {
+        virtual_sol_reserves: 0,
+        virtual_token_reserves: 0,
+        real_sol_reserves: sol_amount,
+        real_token_reserves: 0,
+    });
+
     Some(crate::events::Migration {
         signature: signature.to_string(),
         slot,
@@ -820,6 +828,14 @@ fn decode_migration_event(
         txn_timestamp,
         received_at,
         sent_at: 0,
+        bonding_curve_state,
+        quote_mint: None,
+        lp_mint: None,
+        coin_creator: None,
+        is_mayhem_mode: None,
+        pool_base_amount: None,
+        pool_quote_amount: None,
+        initial_liquidity: None,
     })
 }
 
